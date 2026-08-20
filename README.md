@@ -15,6 +15,8 @@ Local Codex Bridge 是一个面向 Windows 和 macOS 的轻量 MCP stdio 桥接�
 > [!IMPORTANT]
 > 这是非官方社区项目，与 OpenAI 不存在隶属、授权或背书关系。ChatGPT、Codex 和 OpenAI 是其各自权利人的产品或标识。
 
+本仓库 Fork 自 [`zoeynine/Local-Codex-Bridge`](https://github.com/zoeynine/Local-Codex-Bridge)，保留原项目历史与 MIT 许可证；当前 Fork 增加了 macOS 支持及相关兼容、测试和文档工作。
+
 ## 它是怎样工作的
 
 真实的数据链路是：

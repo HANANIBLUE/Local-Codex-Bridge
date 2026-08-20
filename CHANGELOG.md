@@ -10,6 +10,7 @@
 - 完整测试入口在非 Windows 主机跳过 Windows Tray 测试，并保留显式 `npm run test:tray` 命令供 Windows 单独验证。
 - GitHub Actions 验证矩阵扩展为 Windows 与 macOS，统一使用 Node.js 24。
 - `codex_turn` 将主机原生绝对 `cwd` 提升为每次调用的显式必填参数；遗漏时返回可重试的 `input_required` 结果，避免先触发普通工具错误再恢复。
+- 补充 Fork 来源说明以及 MIT、仓库、问题追踪和主页包元数据，公开指向 `HANANIBLUE/Local-Codex-Bridge`。
 - 包版本、Bridge 上游 `clientInfo`、MCP `serverInfo`、测试和公开文档统一为 `2.2.0`。
 - 不捆绑 Codex 运行时、Secure MCP Tunnel 客户端、Tunnel profile、凭据或维护者机器路径；Linux 与 macOS Tray 仍不在支持范围内。
 
