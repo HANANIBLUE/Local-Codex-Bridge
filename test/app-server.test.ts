@@ -306,6 +306,7 @@ test("late thread/start and thread/resume become observable without a follow-on 
       control.call("codex_turn", {
         text: "resume thread",
         thread_id: "thread-resume-late",
+        cwd: TEST_CWD,
       }),
       /operation outcome is UNKNOWN/,
     );

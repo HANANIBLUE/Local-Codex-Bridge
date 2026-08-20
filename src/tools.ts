@@ -113,7 +113,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_turn",
     title: "Start or Continue Codex Turn",
     description:
-      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Returns as soon as turn/start is accepted; observe separately for events and completion.",
+      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. Always provide the absolute host-native cwd, including when resuming; if it is unknown, use codex_threads first. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Returns as soon as turn/start is accepted; observe separately for events and completion.",
     inputSchema: {
       type: "object",
       properties: {
@@ -131,8 +131,9 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         },
         cwd: {
           type: "string",
+          minLength: 1,
           maxLength: 1000,
-          description: "Absolute host-native cwd. Required for a new thread; optional override for resume.",
+          description: "Absolute host-native cwd. Required for every call, including resume.",
         },
         model: {
           type: "string",
@@ -149,8 +150,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         sandbox: sandboxSchema,
         approval_policy: approvalPolicySchema,
       },
-      required: ["text"],
-      anyOf: [{ required: ["thread_id"] }, { required: ["cwd"] }],
+      required: ["text", "cwd"],
       additionalProperties: false,
     },
     annotations: {
@@ -766,10 +766,18 @@ export class ControlSurface {
     const text = requiredString(args, "text");
     const requestedThreadId = optionalString(args, "thread_id", 200);
     const cwdInput = optionalString(args, "cwd", 1_000);
-    if (!requestedThreadId && !cwdInput) {
-      throw new Error("cwd is required when thread_id is omitted");
+    if (!cwdInput) {
+      return {
+        accepted: false,
+        status: "input_required",
+        error_code: "cwd_required",
+        recoverable: true,
+        missing_arguments: ["cwd"],
+        message: "Retry codex_turn with an absolute host-native cwd. If cwd is unknown, call codex_threads first.",
+        ...(requestedThreadId ? { thread_id: requestedThreadId } : {}),
+      };
     }
-    const cwd = cwdInput ? validateCwd(cwdInput) : undefined;
+    const cwd = validateCwd(cwdInput);
     const model = optionalString(args, "model", 100);
     const effort = optionalString(args, "effort", 32);
     const sandbox = enumValue(args, "sandbox", ["read-only", "workspace-write", "danger-full-access"] as const);

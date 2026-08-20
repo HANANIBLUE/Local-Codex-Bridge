@@ -39,6 +39,44 @@ function propertySchema(toolName: string, propertyName: string): Record<string, 
   return object(properties[propertyName]);
 }
 
+test("codex_turn requires cwd explicitly and recovers without starting native work", async (t) => {
+  const turn = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_turn");
+  assert.ok(turn);
+  assert.deepEqual(turn.inputSchema.required, ["text", "cwd"]);
+  assert.equal("anyOf" in turn.inputSchema, false);
+  assert.equal(propertySchema("codex_turn", "cwd").minLength, 1);
+  assert.match(turn.description, /Always provide the absolute host-native cwd/);
+
+  const cases = [
+    { name: "new thread", args: { text: "new work" }, threadId: undefined },
+    {
+      name: "resume",
+      args: { text: "continue work", thread_id: "thread-existing" },
+      threadId: "thread-existing",
+    },
+  ] as const;
+
+  for (const current of cases) {
+    await t.test(current.name, async () => {
+      const manager = new StubAppServerManager((method) => {
+        throw new Error(`unexpected request ${method}`);
+      });
+      const surface = new ControlSurface(manager);
+
+      const result = object(await surface.call("codex_turn", current.args));
+
+      assert.equal(result.accepted, false);
+      assert.equal(result.status, "input_required");
+      assert.equal(result.error_code, "cwd_required");
+      assert.equal(result.recoverable, true);
+      assert.deepEqual(result.missing_arguments, ["cwd"]);
+      assert.match(result.message as string, /call codex_threads first/);
+      assert.equal(result.thread_id, current.threadId);
+      assert.deepEqual(manager.requests, []);
+    });
+  }
+});
+
 test("codex_turn forwards each requested raw sandbox and the exact returned native policy", async (t) => {
   const cases = [
     {
@@ -126,6 +164,7 @@ test("codex_turn uses the newly resolved policy when the same thread changes san
   await surface.call("codex_turn", {
     text: "second",
     thread_id: "thread-shared",
+    cwd: TEST_CWD,
     sandbox: "read-only",
   });
 
@@ -138,6 +177,7 @@ test("codex_turn uses the newly resolved policy when the same thread changes san
   assert.strictEqual(object(manager.requests[1]?.params).sandboxPolicy, workspacePolicy);
   assert.deepEqual(object(manager.requests[2]?.params), {
     threadId: "thread-shared",
+    cwd: TEST_CWD,
     sandbox: "read-only",
   });
   assert.strictEqual(object(manager.requests[3]?.params).sandboxPolicy, readOnlyPolicy);

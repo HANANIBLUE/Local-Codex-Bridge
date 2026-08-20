@@ -21,7 +21,7 @@ MCP client -> Local Codex Bridge (JSON-RPC stdio)
 The seven public tools have distinct semantics:
 
 - `codex_threads`: list/search/read persistent native threads; filters are not access control.
-- `codex_turn`: create or resume a native thread and start a turn; acceptance is not completion.
+- `codex_turn`: create or resume a native thread and start a turn; every call requires an explicit host-native absolute `cwd`, and a missing one returns recoverable input-required state without native work; acceptance is not completion.
 - `codex_observe`: read bounded live state or explicitly degraded persisted history after Bridge state loss.
 - `codex_steer`: append a semantic correction to the exact active turn; do not use it as a timer or retry.
 - `codex_respond`: answer one real pending app-server request using its raw ID and exact scope.

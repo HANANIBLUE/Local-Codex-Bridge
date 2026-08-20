@@ -42,7 +42,7 @@ Local Codex Bridge
 | 工具 | 用途 | 重要边界 |
 | --- | --- | --- |
 | `codex_threads` | 列出、搜索或读取原生 Codex 持久线程 | `cwd` 和搜索词只是筛选条件，不是权限边界；不会重建已经丢失的 Bridge 实时事件 |
-| `codex_turn` | 新建或恢复线程，并启动一个回合 | 新线程必须提供主机原生绝对路径；返回“已接受”不等于任务完成 |
+| `codex_turn` | 新建或恢复线程，并启动一个回合 | 每次调用都必须提供主机原生绝对 `cwd`；返回“已接受”不等于任务完成 |
 | `codex_observe` | 读取有界的实时事件、待处理请求、终态和游标 | `wait_ms` 最长 10 秒，只做一次事件驱动等待；安静不代表卡死 |
 | `codex_steer` | 向同一个活动回合追加纠正或新意图 | 必须匹配准确的 `thread_id` 和 `expected_turn_id`；不会新建回合 |
 | `codex_respond` | 回答真实的审批、用户输入、权限或 elicitation 请求 | 必须使用原始 request ID 及准确的线程、方法和回合范围；不能虚构请求 |
@@ -102,6 +102,8 @@ env:     CODEX_EXE=<absolute Codex executable path>   # 可选
 
 `codex_turn` 只确认 `turn/start` 已被接受。需要持续监督时，应使用有界的 `codex_observe` 等到终态，并在每次返回后检查新事件、待处理请求和当前状态，再决定是否继续观察、`codex_steer`、`codex_respond` 或 `codex_interrupt`。
 
+- 每次 `codex_turn` 都必须显式传入主机原生绝对 `cwd`，包括恢复既有线程；不知道路径时应先用 `codex_threads` 读取线程或查找对应目录。
+- 若调用方仍遗漏 `cwd`，Bridge 会返回可重试的 `input_required` 结果，不会启动原生线程或回合。
 - 长时间没有新命令或输出，不足以证明 Codex 卡住了。
 - 只有新证据或用户意图发生变化时才应 steer。
 - 只有确实存在的 pending request 才能 respond。
