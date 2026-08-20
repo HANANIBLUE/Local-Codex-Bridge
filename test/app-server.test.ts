@@ -17,6 +17,7 @@ const timeoutCodex = fileURLToPath(new URL("../../test/timeout-codex.mjs", impor
 const pendingWriteCodex = fileURLToPath(new URL("../../test/pending-write-codex.mjs", import.meta.url));
 const lateResponseCodex = fileURLToPath(new URL("../../test/late-response-codex.mjs", import.meta.url));
 const duplicateRequestCodex = fileURLToPath(new URL("../../test/duplicate-request-codex.mjs", import.meta.url));
+const TEST_CWD = process.platform === "win32" ? "D:\\Bridge" : "/Bridge";
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -68,7 +69,7 @@ test("control surface starts asynchronously, steers the same turn, uses raw requ
   try {
     const started = await control.call("codex_turn", {
       text: "read only",
-      cwd: "D:\\Bridge",
+      cwd: TEST_CWD,
       sandbox: "read-only",
       approval_policy: "never",
     }) as Record<string, unknown>;
@@ -298,13 +299,14 @@ test("late thread/start and thread/resume become observable without a follow-on 
   const control = new ControlSurface(manager);
   try {
     await assert.rejects(
-      control.call("codex_turn", { text: "new thread", cwd: "D:\\Bridge" }),
+      control.call("codex_turn", { text: "new thread", cwd: TEST_CWD }),
       /operation outcome is UNKNOWN/,
     );
     await assert.rejects(
       control.call("codex_turn", {
         text: "resume thread",
         thread_id: "thread-resume-late",
+        cwd: TEST_CWD,
       }),
       /operation outcome is UNKNOWN/,
     );

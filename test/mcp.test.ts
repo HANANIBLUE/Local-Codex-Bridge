@@ -141,7 +141,7 @@ test("MCP stdio initializes idempotently and lists exactly seven fully annotated
       {
         name: "local-codex-bridge",
         title: "Local Codex Bridge",
-        version: "2.1.2",
+        version: "2.2.0",
       },
     );
 
@@ -215,6 +215,30 @@ test("MCP stdio initializes idempotently and lists exactly seven fully annotated
       checkpointTool?.description as string,
       /Before final acceptance of a checkpointed task, read it once/,
     );
+  } finally {
+    assert.equal(await client.close(), 0);
+  }
+});
+
+test("MCP returns missing codex_turn cwd as recoverable data instead of a tool error", async () => {
+  const client = new TestClient();
+  try {
+    await initialize(client, 1);
+    const response = await client.request(2, "tools/call", {
+      name: "codex_turn",
+      arguments: { text: "work that still needs a cwd" },
+    });
+
+    assert.equal(response.error, undefined);
+    assert.equal((response.result as Record<string, unknown>).isError, undefined);
+    assert.deepEqual(toolPayload(response), {
+      accepted: false,
+      status: "input_required",
+      error_code: "cwd_required",
+      recoverable: true,
+      missing_arguments: ["cwd"],
+      message: "Retry codex_turn with an absolute host-native cwd. If cwd is unknown, call codex_threads first.",
+    });
   } finally {
     assert.equal(await client.close(), 0);
   }

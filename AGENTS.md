@@ -21,7 +21,7 @@ MCP client -> Local Codex Bridge (JSON-RPC stdio)
 The seven public tools have distinct semantics:
 
 - `codex_threads`: list/search/read persistent native threads; filters are not access control.
-- `codex_turn`: create or resume a native thread and start a turn; acceptance is not completion.
+- `codex_turn`: create or resume a native thread and start a turn; every call requires an explicit host-native absolute `cwd`, and a missing one returns recoverable input-required state without native work; acceptance is not completion.
 - `codex_observe`: read bounded live state or explicitly degraded persisted history after Bridge state loss.
 - `codex_steer`: append a semantic correction to the exact active turn; do not use it as a timer or retry.
 - `codex_respond`: answer one real pending app-server request using its raw ID and exact scope.
@@ -44,11 +44,11 @@ Do not modify a user's Codex installation, Tunnel authentication/profile, unrela
 
 Inspect the current checkout and target machine before deciding how to install or run it. Do not copy maintainer-specific paths, profiles, ports, PIDs, readiness URLs, or executable locations.
 
-The published implementation currently requires Node.js 24+ and claims Windows support only. New-thread working directories must be absolute Windows drive-letter paths. Resolve the official Codex executable from the target machine's `PATH` or an explicit `CODEX_EXE`; do not add an npm Codex runtime dependency.
+This checkout requires Node.js 24+ and supports Windows and macOS. New-thread working directories must use a host-native absolute path: Windows drive-letter paths on Windows and POSIX absolute paths on macOS. Resolve the official Codex executable from the target machine's `PATH` or an explicit `CODEX_EXE`; do not add an npm Codex runtime dependency.
 
 For a strict MCP stdio client or Tunnel, execute the built entry point with Node directly. `npm start` is suitable for a terminal but npm lifecycle output can corrupt a strict stdout protocol stream. Treat Secure MCP Tunnel setup as external configuration. If the optional Tray is needed, discover and supply that machine's readiness URL, Tunnel profile, and executable, then preserve its exact-process identity checks and no-auto-restart behavior.
 
-Prefer evidence from the current source, tests, package metadata, and actual machine over old paths or remembered deployment state. If documentation and behavior diverge, establish the source/test truth before changing claims. Do not claim macOS or Linux support without implementation changes and real validation.
+Prefer evidence from the current source, tests, package metadata, and actual machine over old paths or remembered deployment state. If documentation and behavior diverge, establish the source/test truth before changing claims. Do not claim Linux support without implementation changes and real validation.
 
 ## Acceptance expectations
 
