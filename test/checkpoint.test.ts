@@ -80,9 +80,9 @@ test("checkpoint directory resolution preserves legacy data and honors canonical
   const canonicalDefault = join(base, "LocalCodexBridge", "checkpoints");
 
   try {
-    assert.equal(resolveCheckpointDirectory({ LOCALAPPDATA: base }), canonicalDefault);
+    assert.equal(resolveCheckpointDirectory({ LOCALAPPDATA: base }, "win32"), canonicalDefault);
     mkdirSync(legacyDefault, { recursive: true });
-    assert.equal(resolveCheckpointDirectory({ LOCALAPPDATA: base }), legacyDefault);
+    assert.equal(resolveCheckpointDirectory({ LOCALAPPDATA: base }, "win32"), legacyDefault);
 
     const explicitCanonical = join(base, "explicit-canonical");
     const explicitLegacy = join(base, "explicit-legacy");
@@ -91,15 +91,27 @@ test("checkpoint directory resolution preserves legacy data and honors canonical
         LOCALAPPDATA: base,
         [CHECKPOINT_DIRECTORY_ENV]: explicitCanonical,
         [LEGACY_CHECKPOINT_DIRECTORY_ENV]: explicitLegacy,
-      }),
+      }, "win32"),
       explicitCanonical,
     );
     assert.equal(
       resolveCheckpointDirectory({
         LOCALAPPDATA: base,
         [LEGACY_CHECKPOINT_DIRECTORY_ENV]: explicitLegacy,
-      }),
+      }, "win32"),
       explicitLegacy,
+    );
+
+    const macHome = join(base, "mac-home");
+    assert.equal(
+      resolveCheckpointDirectory({ HOME: macHome }, "darwin"),
+      join(macHome, "Library", "Application Support", "LocalCodexBridge", "checkpoints"),
+    );
+
+    const linuxState = join(base, "linux-state");
+    assert.equal(
+      resolveCheckpointDirectory({ HOME: join(base, "linux-home"), XDG_STATE_HOME: linuxState }, "linux"),
+      join(linuxState, "LocalCodexBridge", "checkpoints"),
     );
   } finally {
     rmSync(base, { recursive: true, force: true });

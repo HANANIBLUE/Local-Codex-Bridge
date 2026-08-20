@@ -167,6 +167,7 @@ function isMissingFile(error: unknown): boolean {
 
 export function resolveCheckpointDirectory(
   environment: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): string {
   const configured = environment[CHECKPOINT_DIRECTORY_ENV]?.trim();
   if (configured) {
@@ -184,15 +185,23 @@ export function resolveCheckpointDirectory(
     return resolve(legacyConfigured);
   }
 
-  const localAppData = environment.LOCALAPPDATA?.trim();
-  const userProfile = environment.USERPROFILE?.trim() || homedir();
-  const base = localAppData || join(userProfile, "AppData", "Local");
+  const home = environment.HOME?.trim() || environment.USERPROFILE?.trim() || homedir();
+  let base: string;
+  if (platform === "win32") {
+    base = environment.LOCALAPPDATA?.trim() || join(home, "AppData", "Local");
+  } else if (platform === "darwin") {
+    base = join(home, "Library", "Application Support");
+  } else {
+    base = environment.XDG_STATE_HOME?.trim() || join(home, ".local", "state");
+  }
   if (!isAbsolute(base)) {
     throw new Error("Unable to resolve an absolute local app-data directory for checkpoints");
   }
-  const legacyDefault = join(base, "Lumen", "CodexControlV2", "checkpoints");
-  if (existsSync(legacyDefault)) {
-    return legacyDefault;
+  if (platform === "win32") {
+    const legacyDefault = join(base, "Lumen", "CodexControlV2", "checkpoints");
+    if (existsSync(legacyDefault)) {
+      return legacyDefault;
+    }
   }
   return join(base, "LocalCodexBridge", "checkpoints");
 }

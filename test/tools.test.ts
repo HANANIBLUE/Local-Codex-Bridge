@@ -5,6 +5,8 @@ import { AppServerManager } from "../src/app-server.js";
 import { RuntimeStore } from "../src/runtime.js";
 import { ControlSurface, TOOL_DEFINITIONS } from "../src/tools.js";
 
+const TEST_CWD = process.platform === "win32" ? "D:\\work" : "/work";
+
 interface CapturedRequest {
   method: string;
   params: unknown;
@@ -74,14 +76,14 @@ test("codex_turn forwards each requested raw sandbox and the exact returned nati
 
       await surface.call("codex_turn", {
         text: "test turn",
-        cwd: "D:\\work",
+        cwd: TEST_CWD,
         sandbox: requested,
       });
 
       assert.equal(manager.requests.length, 2);
       assert.equal(manager.requests[0]?.method, "thread/start");
       assert.deepEqual(object(manager.requests[0]?.params), {
-        cwd: "D:\\work",
+        cwd: TEST_CWD,
         sandbox: requested,
         serviceName: "local-codex-bridge",
       });
@@ -118,7 +120,7 @@ test("codex_turn uses the newly resolved policy when the same thread changes san
 
   await surface.call("codex_turn", {
     text: "first",
-    cwd: "D:\\work",
+    cwd: TEST_CWD,
     sandbox: "workspace-write",
   });
   await surface.call("codex_turn", {
@@ -156,7 +158,7 @@ test("codex_turn omits turn-level sandboxPolicy when sandbox was not requested",
   });
   const surface = new ControlSurface(manager);
 
-  await surface.call("codex_turn", { text: "default sandbox", cwd: "D:\\work" });
+  await surface.call("codex_turn", { text: "default sandbox", cwd: TEST_CWD });
 
   assert.equal("sandbox" in object(manager.requests[0]?.params), false);
   assert.equal("sandboxPolicy" in object(manager.requests[1]?.params), false);
@@ -188,7 +190,7 @@ test("codex_turn fails closed before turn/start for unusable returned sandbox po
       await assert.rejects(
         surface.call("codex_turn", {
           text: "must not start",
-          cwd: "D:\\work",
+          cwd: TEST_CWD,
           sandbox: "workspace-write",
         }),
         /sandbox/,

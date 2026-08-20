@@ -15,9 +15,16 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify (Windows / Node 24)
-    runs-on: windows-latest
+    name: Verify (${{ matrix.os }} / Node 24)
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
 
     steps:
       - name: Checkout

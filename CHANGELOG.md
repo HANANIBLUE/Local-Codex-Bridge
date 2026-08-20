@@ -1,6 +1,16 @@
 # 更新日志
 
-本文件只记录当前公共仓库 Git 历史中可以核验的事实。当前公开版本为 **V2.1.2**；公共历史中没有单独的 V2.1.0 发布记录。
+本文件只记录当前公共仓库 Git 历史中可以核验的事实。当前公开版本为 **V2.2.0**；公共历史中没有单独的 V2.1.0 发布记录。
+
+## V2.2.0（2026-08-21）
+
+- 核心 Bridge 新增 macOS 支持：Windows 继续接受绝对盘符路径并拒绝 UNC / device path，macOS 接受 POSIX 绝对路径。
+- checkpoint 默认目录按主机平台选择：Windows 使用 `%LOCALAPPDATA%`，macOS 使用 `~/Library/Application Support/LocalCodexBridge/checkpoints`；既有 Windows 兼容逻辑保持不变。
+- live smoke prompt 在 Windows 使用 PowerShell，在 macOS 使用 POSIX 命令；仍只执行明确授权的真实 Codex smoke 测试。
+- 完整测试入口在非 Windows 主机跳过 Windows Tray 测试，并保留显式 `npm run test:tray` 命令供 Windows 单独验证。
+- GitHub Actions 验证矩阵扩展为 Windows 与 macOS，统一使用 Node.js 24。
+- 包版本、Bridge 上游 `clientInfo`、MCP `serverInfo`、测试和公开文档统一为 `2.2.0`。
+- 不捆绑 Codex 运行时、Secure MCP Tunnel 客户端、Tunnel profile、凭据或维护者机器路径；Linux 与 macOS Tray 仍不在支持范围内。
 
 ## V2.1.2（2026-08-12）
 

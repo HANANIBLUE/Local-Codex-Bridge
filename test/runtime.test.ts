@@ -12,7 +12,7 @@ import {
 import {
   ControlSurface,
   TOOL_DEFINITIONS,
-  validateWindowsCwd,
+  validateCwd,
 } from "../src/tools.js";
 
 async function within<T>(promise: Promise<T>, milliseconds = 150): Promise<T> {
@@ -66,11 +66,16 @@ test("sanitizer redacts obvious secrets and bounds strings", () => {
   assert.match(result.text as string, /truncated/);
 });
 
-test("cwd check accepts drive paths and rejects UNC/device/relative paths", () => {
-  assert.equal(validateWindowsCwd("D:/Bridge/project"), "D:\\Bridge\\project");
-  assert.throws(() => validateWindowsCwd("relative\\path"), /drive-letter/);
-  assert.throws(() => validateWindowsCwd("\\\\server\\share"), /UNC or Windows device/);
-  assert.throws(() => validateWindowsCwd("\\\\?\\D:\\Bridge"), /UNC or Windows device/);
+test("cwd check preserves host-native absolute path rules", () => {
+  assert.equal(validateCwd("D:/Bridge/project", "win32"), "D:\\Bridge\\project");
+  assert.throws(() => validateCwd("relative\\path", "win32"), /drive-letter/);
+  assert.throws(() => validateCwd("\\\\server\\share", "win32"), /UNC or Windows device/);
+  assert.throws(() => validateCwd("\\\\?\\D:\\Bridge", "win32"), /UNC or Windows device/);
+  assert.equal(validateCwd("/Users/example/Bridge/../project", "darwin"), "/Users/example/project");
+  assert.equal(validateCwd("/srv/local-codex-bridge", "linux"), "/srv/local-codex-bridge");
+  assert.throws(() => validateCwd("relative/path", "darwin"), /absolute POSIX/);
+  assert.throws(() => validateCwd("relative/path", "linux"), /absolute POSIX/);
+  assert.throws(() => validateCwd("/tmp/bridge\0secret", "darwin"), /NUL/);
 });
 
 test("runtime ring uses monotonic cursors, scopes pending raw ids, and captures terminal output", () => {

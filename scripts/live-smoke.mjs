@@ -4,6 +4,12 @@ import { fileURLToPath } from "node:url";
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const entry = fileURLToPath(new URL("../dist/src/index.js", import.meta.url));
 const smokeCwd = process.env.SMOKE_CWD || projectRoot;
+const firstSmokePrompt = process.platform === "win32"
+  ? "Read-only smoke: run PowerShell Start-Sleep -Seconds 6, then read package.json without modifying anything, and finish with exactly V2_SMOKE_OK."
+  : "Read-only smoke: run sleep 6, then read package.json without modifying anything, and finish with exactly V2_SMOKE_OK.";
+const stagedSmokePrompt = process.platform === "win32"
+  ? "Read-only staged smoke: use the command tool to run exactly PowerShell -NoProfile -Command \"Start-Sleep -Seconds 15; Get-Content -LiteralPath package.json -TotalCount 1\". Do not modify anything. Only after the command finishes, answer V2_UNSTEERED."
+  : "Read-only staged smoke: use the command tool to run exactly sh -c 'sleep 15; head -n 1 package.json'. Do not modify anything. Only after the command finishes, answer V2_UNSTEERED.";
 
 if (!process.env.CODEX_EXE) {
   throw new Error("Set CODEX_EXE to a Codex executable before running the live smoke test.");
@@ -138,7 +144,7 @@ try {
     cwd: smokeCwd,
     sandbox: "read-only",
     approval_policy: "never",
-    text: "Read-only smoke: run PowerShell Start-Sleep -Seconds 6, then read package.json without modifying anything, and finish with exactly V2_SMOKE_OK.",
+    text: firstSmokePrompt,
   });
   const acceptedMs = Date.now() - startedAt;
   const immediate = await first.call("codex_observe", {
@@ -204,7 +210,7 @@ try {
       cwd: smokeCwd,
       sandbox: "read-only",
       approval_policy: "untrusted",
-      text: "Read-only staged smoke: use the command tool to run exactly PowerShell -NoProfile -Command \"Start-Sleep -Seconds 15; Get-Content -LiteralPath package.json -TotalCount 1\". Do not modify anything. Only after the command finishes, answer V2_UNSTEERED.",
+      text: stagedSmokePrompt,
     });
     let stagedState = null;
     let pendingApproval = null;
