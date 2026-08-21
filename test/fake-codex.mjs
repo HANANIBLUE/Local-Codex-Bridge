@@ -41,6 +41,22 @@ lines.on("line", (line) => {
     });
     return;
   }
+  if (message.method === "test/env-presence") {
+    const has = (name) => Object.prototype.hasOwnProperty.call(process.env, name);
+    send({
+      id: message.id,
+      result: {
+        hasControlPlaneApiKey: has("CONTROL_PLANE_API_KEY"),
+        hasOpenAiApiKey: has("OPENAI_API_KEY"),
+        hasHome: has("HOME"),
+        hasPath: has("PATH"),
+        hasSdkRoot: has("SDKROOT"),
+        hasCodexExe: has("CODEX_EXE"),
+        hasPassthroughConfig: has("LOCAL_CODEX_BRIDGE_APP_SERVER_ENV_PASSTHROUGH"),
+      },
+    });
+    return;
+  }
   if (message.method === "thread/resume") {
     currentThread = message.params.threadId;
     send({ id: message.id, result: { thread: { id: currentThread } } });

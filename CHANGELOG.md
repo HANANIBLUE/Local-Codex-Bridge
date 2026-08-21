@@ -22,6 +22,9 @@ V2.2.0 聚焦核心 Bridge 的平台兼容、fatal 生命周期和工具契约�
 - MCP 顶层在 fatal 后停止接收新请求，对已经进入处理阶段的请求和响应做最长 1 秒的有界 drain，然后以非零状态退出，使外部监督层能够检测并选择重启整条链。fatal、信号和正常关闭共享幂等关闭协调，正常 stdin EOF、显式 close、SIGINT 和 SIGTERM 不会被标成 app-server fatal。
 - fatal 工具错误尽量返回稳定字段 `error_code: "app_server_fatal"`、`status: "app_server_fatal"`、`recoverable: true`、`bridge_exiting: true` 和 `next_action: "restart_or_reconnect_then_codex_threads"`；该结构化结果属于 best effort，传输先断开时客户端可能只看到断连。
 - 客户端恢复时应先重新建立 Tunnel / MCP 连接，再调用 `codex_threads` 对齐持久状态；不得假设旧回合一定已经停止，因为 Bridge 内存态丢失不等于原生持久状态不存在。
+- Bridge → Codex app-server 的环境从完整 `process.env` 继承改为固定兼容 baseline 加显式变量名 passthrough；构造出的新 child env 默认拒绝未知变量，并对 Tunnel/control-plane 专属 credential 名执行不可覆盖的 hard deny。
+- `LOCAL_CODEX_BRIDGE_APP_SERVER_ENV_PASSTHROUGH` 可恢复 baseline 外的必要 SDK / toolchain 变量；非法、重复、Windows 大小写歧义或显式 hard-deny 请求会在启动 app-server 前失败关闭，不会回退到完整环境继承。
+- `OPENAI_API_KEY` 默认不传给 app-server，只有显式加入 passthrough 时才允许；部署者必须先确认 Tunnel 已使用独立 control-plane credential，因为 Bridge 无法验证 credential provenance。环境收紧可能影响依赖 baseline 外变量的现有部署，可通过显式 passthrough 恢复所需变量。
 - 补充 Fork 来源说明以及 MIT、仓库、问题追踪和主页包元数据，公开指向 `HANANIBLUE/Local-Codex-Bridge`。
 - 包版本、Bridge 上游 `clientInfo`、MCP `serverInfo`、测试和公开文档统一为 `2.2.0`。
 - 不捆绑 Codex 运行时、Secure MCP Tunnel 客户端、Tunnel profile、凭据或维护者机器路径；Linux 与 macOS Tray 仍不在支持范围内。

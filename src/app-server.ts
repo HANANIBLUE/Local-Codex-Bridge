@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 
+import { buildAppServerEnv } from "./app-server-env.js";
 import {
   RuntimeStore,
   redactText,
@@ -52,6 +53,8 @@ interface RetainedLateResponse {
 export interface AppServerLaunchOptions {
   executable?: string;
   prefixArgs?: readonly string[];
+  environment?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
   requestTimeoutMs?: number;
   lateResponseTtlMs?: number;
   lateResponseLimit?: number;
@@ -347,6 +350,7 @@ export class AppServerManager {
 
   readonly #executable: string;
   readonly #prefixArgs: readonly string[];
+  readonly #childEnvironment: NodeJS.ProcessEnv;
   readonly #requestTimeoutMs: number;
   readonly #lateResponseTtlMs: number;
   readonly #lateResponseLimit: number;
@@ -375,8 +379,12 @@ export class AppServerManager {
     options: AppServerLaunchOptions = {},
   ) {
     this.runtime = runtime;
-    this.#executable = options.executable ?? resolveCodexExecutable();
+    const environment = options.environment ?? process.env;
+    const platform = options.platform ?? process.platform;
+    this.#executable =
+      options.executable ?? resolveCodexExecutable(environment);
     this.#prefixArgs = options.prefixArgs ?? [];
+    this.#childEnvironment = buildAppServerEnv(environment, platform);
     this.#requestTimeoutMs =
       options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.#lateResponseTtlMs = positiveIntegerOption(
@@ -449,7 +457,7 @@ export class AppServerManager {
           stdio: ["pipe", "pipe", "pipe"],
           shell: false,
           windowsHide: true,
-          env: process.env,
+          env: this.#childEnvironment,
         },
       );
     } catch (error) {

@@ -9,6 +9,12 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  APP_SERVER_ENV_PASSTHROUGH,
+  APP_SERVER_HARD_DENY_ENV_NAMES,
+  buildAppServerEnv,
+  parseAppServerEnvPassthrough,
+} from "../src/app-server-env.js";
+import {
   AppServerFatalError,
   AppServerManager,
   AppServerShutdownError,
@@ -201,6 +207,11 @@ function createControlledAppServer(
   const manager = new AppServerManager(undefined, {
     executable: "controlled-codex",
     prefixArgs: ["--controlled-prefix"],
+    environment: {
+      HOME: "/controlled/home",
+      PATH: "/controlled/bin",
+    },
+    platform: "darwin",
     requestTimeoutMs: 500,
     stdoutExitGraceMs,
     spawnAppServer: (executable, args, options) => {
@@ -214,7 +225,11 @@ function createControlledAppServer(
       assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe"]);
       assert.equal(options.shell, false);
       assert.equal(options.windowsHide, true);
-      assert.equal(options.env, process.env);
+      assert.notEqual(options.env, process.env);
+      assert.deepEqual(options.env, {
+        HOME: "/controlled/home",
+        PATH: "/controlled/bin",
+      });
       spawnedChild = new ControlledAppServerChild();
       return spawnedChild;
     },
@@ -228,6 +243,253 @@ function createControlledAppServer(
     },
   };
 }
+
+test("app-server environment policy keeps a safe baseline and explicit passthrough", async (t) => {
+  await t.test("retains baseline values, including empty strings, without mutating source", () => {
+    const source: NodeJS.ProcessEnv = {
+      HOME: "/fake/home",
+      PATH: "/fake/bin",
+      LANG: "",
+      SSH_AUTH_SOCK: "/fake/ssh-agent.sock",
+      HTTPS_PROXY: "https://fake-proxy.invalid",
+      NODE_EXTRA_CA_CERTS: "/fake/ca.pem",
+      UNKNOWN_VAR: "nope",
+      SDKROOT: "/fake/sdk",
+      OPENAI_API_KEY: "OPENAI_CANARY",
+      CONTROL_PLANE_API_KEY: "CONTROL_PLANE_CANARY",
+      OPTIONAL_UNDEFINED: undefined,
+    };
+    const snapshot = { ...source };
+
+    const result = buildAppServerEnv(source, "darwin");
+
+    assert.deepEqual(result, {
+      HOME: "/fake/home",
+      PATH: "/fake/bin",
+      LANG: "",
+      SSH_AUTH_SOCK: "/fake/ssh-agent.sock",
+      HTTPS_PROXY: "https://fake-proxy.invalid",
+      NODE_EXTRA_CA_CERTS: "/fake/ca.pem",
+    });
+    assert.deepEqual(source, snapshot);
+    assert.notEqual(result, source);
+  });
+
+  await t.test("passes only explicitly named extra variables", () => {
+    const source: NodeJS.ProcessEnv = {
+      HOME: "/fake/home",
+      SDKROOT: "/fake/sdk",
+      CPATH: "/fake/include",
+      LIBRARY_PATH: "",
+      OPENAI_API_KEY: "OPENAI_CANARY",
+      MISSING_VALUE: undefined,
+      [APP_SERVER_ENV_PASSTHROUGH]:
+        " SDKROOT , CPATH, LIBRARY_PATH , OPENAI_API_KEY, MISSING_VALUE ",
+    };
+
+    assert.deepEqual(buildAppServerEnv(source, "darwin"), {
+      HOME: "/fake/home",
+      SDKROOT: "/fake/sdk",
+      CPATH: "/fake/include",
+      LIBRARY_PATH: "",
+      OPENAI_API_KEY: "OPENAI_CANARY",
+    });
+  });
+
+  await t.test("treats missing and ASCII-blank passthrough as empty", () => {
+    assert.deepEqual(parseAppServerEnvPassthrough(undefined, "darwin"), []);
+    assert.deepEqual(
+      parseAppServerEnvPassthrough(" \t\v\f\r\n", "darwin"),
+      [],
+    );
+    assert.deepEqual(
+      parseAppServerEnvPassthrough(" SDKROOT ,\vCPATH ", "darwin"),
+      ["SDKROOT", "CPATH"],
+    );
+  });
+
+  await t.test("rejects malformed or duplicate passthrough configuration", () => {
+    for (const configured of [
+      "A,,B",
+      ",A",
+      "A,",
+      "A, ,B",
+      "NOT-PORTABLE",
+      "ProgramFiles(x86)",
+      "A,A",
+      "A,\u00a0B",
+    ]) {
+      assert.throws(
+        () => parseAppServerEnvPassthrough(configured, "darwin"),
+        /Invalid|Duplicate/,
+      );
+    }
+  });
+
+  await t.test("removes every hard-deny variable and rejects explicit requests", () => {
+    const source: NodeJS.ProcessEnv = Object.fromEntries(
+      APP_SERVER_HARD_DENY_ENV_NAMES.map((name) => [name, `${name}_CANARY`]),
+    );
+    assert.deepEqual(buildAppServerEnv(source, "darwin"), {});
+
+    for (const name of APP_SERVER_HARD_DENY_ENV_NAMES) {
+      assert.throws(
+        () =>
+          buildAppServerEnv(
+            {
+              [name]: `${name}_CANARY`,
+              [APP_SERVER_ENV_PASSTHROUGH]: name,
+            },
+            "darwin",
+          ),
+        new RegExp(`hard-denied variable ${name}`),
+      );
+    }
+    assert.throws(
+      () =>
+        buildAppServerEnv(
+          {
+            control_plane_api_key: "LOWERCASE_CANARY",
+            [APP_SERVER_ENV_PASSTHROUGH]: "control_plane_api_key",
+          },
+          "darwin",
+        ),
+      /hard-denied variable CONTROL_PLANE_API_KEY/,
+    );
+  });
+
+  await t.test("uses Windows case-insensitive lookup and rejects ambiguity", () => {
+    const source: NodeJS.ProcessEnv = {
+      Path: "C:\\fake\\bin",
+      userprofile: "C:\\fake\\user",
+      SystemRoot: "C:\\Windows",
+      ComSpec: "C:\\Windows\\System32\\cmd.exe",
+      "ProgramFiles(x86)": "C:\\Program Files (x86)",
+      sdkroot: "C:\\fake\\sdk",
+      OpenAi_Api_Key: "OPENAI_CANARY",
+      local_codex_bridge_app_server_env_passthrough:
+        "SDKROOT,OPENAI_API_KEY",
+    };
+
+    assert.deepEqual(buildAppServerEnv(source, "win32"), {
+      Path: "C:\\fake\\bin",
+      userprofile: "C:\\fake\\user",
+      SystemRoot: "C:\\Windows",
+      ComSpec: "C:\\Windows\\System32\\cmd.exe",
+      "ProgramFiles(x86)": "C:\\Program Files (x86)",
+      sdkroot: "C:\\fake\\sdk",
+      OpenAi_Api_Key: "OPENAI_CANARY",
+    });
+    assert.throws(
+      () => parseAppServerEnvPassthrough("Path,PATH", "win32"),
+      /Duplicate/,
+    );
+    assert.throws(
+      () => buildAppServerEnv({ Path: "one", PATH: "two" }, "win32"),
+      /case-ambiguous variable names: PATH/,
+    );
+    assert.throws(
+      () =>
+        buildAppServerEnv(
+          {
+            Control_Plane_Api_Key: "CONTROL_CANARY",
+            local_codex_bridge_app_server_env_passthrough:
+              "control_plane_api_key",
+          },
+          "win32",
+        ),
+      /hard-denied variable CONTROL_PLANE_API_KEY/,
+    );
+  });
+
+  await t.test("keeps POSIX lookup case-sensitive while deny checks remain case-insensitive", () => {
+    assert.deepEqual(
+      buildAppServerEnv(
+        {
+          PATH: "/fake/bin",
+          Path: "/different/bin",
+          [APP_SERVER_ENV_PASSTHROUGH]: "Path",
+        },
+        "darwin",
+      ),
+      {
+        PATH: "/fake/bin",
+        Path: "/different/bin",
+      },
+    );
+  });
+
+  await t.test("fails in the manager constructor without reporting app-server fatal", () => {
+    const fatals: AppServerFatalError[] = [];
+    assert.throws(
+      () =>
+        new AppServerManager(undefined, {
+          environment: {
+            [APP_SERVER_ENV_PASSTHROUGH]: "A,,B",
+          },
+          platform: "darwin",
+          onFatal: (error) => fatals.push(error),
+        }),
+      new RegExp(`Invalid ${APP_SERVER_ENV_PASSTHROUGH}`),
+    );
+    assert.deepEqual(fatals, []);
+  });
+});
+
+test("AppServerManager spawns with the filtered app-server environment", async () => {
+  async function readPresence(
+    passthrough: string | undefined,
+  ): Promise<Record<string, unknown>> {
+    const source: NodeJS.ProcessEnv = {
+      CODEX_EXE: process.execPath,
+      HOME: "/fake/home",
+      PATH: "/fake/bin",
+      CONTROL_PLANE_API_KEY: "CONTROL_PLANE_CANARY",
+      OPENAI_API_KEY: "OPENAI_CANARY",
+      SDKROOT: "/fake/sdk",
+      UNKNOWN_VAR: "UNKNOWN_CANARY",
+      ...(passthrough === undefined
+        ? {}
+        : { [APP_SERVER_ENV_PASSTHROUGH]: passthrough }),
+    };
+    const manager = new AppServerManager(undefined, {
+      prefixArgs: [fakeCodex],
+      environment: source,
+      platform: process.platform,
+      requestTimeoutMs: 2_000,
+    });
+    try {
+      return (await manager.request("test/env-presence", {})) as Record<
+        string,
+        unknown
+      >;
+    } finally {
+      await manager.close();
+    }
+  }
+
+  assert.deepEqual(await readPresence(undefined), {
+    hasControlPlaneApiKey: false,
+    hasOpenAiApiKey: false,
+    hasHome: true,
+    hasPath: true,
+    hasSdkRoot: false,
+    hasCodexExe: false,
+    hasPassthroughConfig: false,
+  });
+  assert.deepEqual(
+    await readPresence("SDKROOT,OPENAI_API_KEY"),
+    {
+      hasControlPlaneApiKey: false,
+      hasOpenAiApiKey: true,
+      hasHome: true,
+      hasPath: true,
+      hasSdkRoot: true,
+      hasCodexExe: false,
+      hasPassthroughConfig: false,
+    },
+  );
+});
 
 test("control surface starts asynchronously, steers the same turn, uses raw request id, and observes final", async () => {
   const manager = new AppServerManager(undefined, {

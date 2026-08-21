@@ -138,6 +138,52 @@ node <absolute repository path>/dist/src/index.js
 
 Tunnel 的安装、认证、profile、端口、ready endpoint 和进程生命周期都属于外部配置。本仓库不会创建或修改 Tunnel profile，也没有内置生产端口或凭据。
 
+### Bridge → Codex app-server 环境边界
+
+Bridge 不会再把自己的完整进程环境复制给 Codex app-server。它会构造一个新的子进程环境，只保留下列安全兼容 baseline 中实际存在的变量：
+
+- 身份、路径和临时目录：`HOME`、`PATH`、`SHELL`、`USER`、`LOGNAME`、`CODEX_HOME`、`TMPDIR`、`TMP`、`TEMP`
+- locale 和终端表现：`LANG`、`LC_ALL`、`LC_CTYPE`、`LC_COLLATE`、`LC_MESSAGES`、`LC_MONETARY`、`LC_NUMERIC`、`LC_TIME`、`TERM`、`COLORTERM`、`NO_COLOR`
+- SSH agent：`SSH_AUTH_SOCK`
+- proxy：`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 及对应的小写名称
+- CA / certificate：`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR`
+- XDG 路径：`XDG_CONFIG_HOME`、`XDG_CACHE_HOME`、`XDG_DATA_HOME`、`XDG_STATE_HOME`
+- Windows：`USERPROFILE`、`HOMEDRIVE`、`HOMEPATH`、`APPDATA`、`LOCALAPPDATA`、`PROGRAMDATA`、`SYSTEMROOT`、`WINDIR`、`SYSTEMDRIVE`、`COMSPEC`、`PATHEXT`、`ProgramFiles`、`ProgramFiles(x86)`、`ProgramW6432`
+
+完整 canonical 列表和 Windows 大小写处理以 [`src/app-server-env.ts`](src/app-server-env.ts) 为准。未列入 baseline 的 SDK 或工具链变量默认不会进入 app-server；确实需要时，只能显式列出变量名：
+
+```text
+LOCAL_CODEX_BRIDGE_APP_SERVER_ENV_PASSTHROUGH=SDKROOT,CPATH,LIBRARY_PATH
+```
+
+配置只包含逗号分隔的 portable 变量名，value 仍来自 Bridge 的启动环境。空项、非法名称、重复名称、Windows 下仅大小写不同的重复名称以及显式请求 hard-deny 名都会使 Bridge 在启动 app-server 前失败关闭；不会退回完整环境继承。该配置变量本身也不会传给 app-server。
+
+以下 Tunnel / control-plane 专属名称是不可覆盖的 hard deny，不能通过 passthrough 重新开启：
+
+```text
+CONTROL_PLANE_API_KEY
+OPENAI_ADMIN_KEY
+CLOUDFLARED_TUNNEL_TOKEN
+CONTROL_PLANE_CLIENT_KEY
+CONTROL_PLANE_EXTRA_HEADERS
+MCP_CLIENT_KEY
+MCP_EXTRA_HEADERS
+MCP_DISCOVERY_EXTRA_HEADERS
+```
+
+`OPENAI_API_KEY` 默认不进入 app-server，但它不是不可覆盖的 hard deny。如果 Codex 确实需要该变量，必须先让 Tunnel 使用独立的 control-plane credential，并确认 Tunnel 不再依赖 `OPENAI_API_KEY` fallback，然后才可把 `OPENAI_API_KEY` 显式加入 passthrough。Bridge 只看到变量名和值，无法自动验证 credential provenance；这个前置条件由部署者负责确认。
+
+Tunnel 支持把专用凭据放在外部文件中，例如：
+
+```yaml
+control_plane:
+  api_key: file:/absolute/path/to/control-plane-api-key
+```
+
+建议 secret 文件权限为 `0600`，父目录为 `0700`。Tunnel 配置存在 flag、环境变量和 YAML 的优先级；迁移到 YAML `file:` 后，不要继续在 Tunnel 启动环境中设置 `CONTROL_PLANE_API_KEY`，否则环境配置可能覆盖 YAML。本仓库不会代替部署者创建文件、修改 profile 或执行真实凭据迁移。
+
+`SSH_AUTH_SOCK` 默认保留是为了避免破坏 Git/SSH 工作流。它是能力接口而非普通无害字符串，因此同一用户身份运行的 Codex 命令仍可能向用户现有 ssh-agent 请求签名。这里的安全保证是 Bridge 阻止 Tunnel/control-plane 专属凭据进入 Codex app-server 的可执行环境，不是“Codex 环境中不存在任何凭据”。
+
 V2.2.0 不提供 macOS LaunchAgent、KeepAlive、watchdog、日志轮转或卸载脚本；这些后台运行能力计划在未来 V2.3.0 单独交付。
 
 ## 可选：Windows Tray
@@ -165,7 +211,7 @@ Local Codex Bridge 不会创建新的操作系统沙箱。真正的文件、命�
 
 - `codex_turn` / `codex_steer` 传入的文本可能促使 Codex 使用其已配置的命令和文件能力；“没有直接暴露 shell 工具”不等于“不会执行本机操作”。
 - `codex_threads` 能看到同一操作系统用户和同一 Codex app-server 可见的持久线程；`cwd` 与搜索条件不能隔离访问。
-- Bridge 会把自身进程环境继承给 app-server 子进程。启动环境应被视为可信边界，不要放入无关且不必要的秘密。
+- Bridge 只把固定兼容 baseline 和显式允许的额外变量复制到 app-server 子进程，并对 Tunnel/control-plane 专属凭据执行不可覆盖的 hard deny；它不会把完整 `process.env` 交给 app-server。这是进程环境边界，不是操作系统沙箱。
 - 实时事件和 pending request 会被限量，并对明显的敏感内容做清理；这只能减少意外暴露，不能把 Bridge 变成敌对多租户网关或跨用户隔离层。
 - 远程使用时，应由经过认证、配置正确的 Tunnel 提供连接边界；不要把本地 stdio 控制面直接暴露给不可信来源。
 - checkpoint 应保持简短且不含敏感信息；不要保存 prompt、逐字记录、原始事件、命令输出或最终回答。
