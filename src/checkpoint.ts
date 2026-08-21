@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  constants,
   closeSync,
   existsSync,
+  fchmodSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readSync,
@@ -18,6 +21,8 @@ export const CHECKPOINT_THREAD_ID_LIMIT = 200;
 export const CHECKPOINT_TEXT_LIMIT = 4_000;
 
 const MAX_CHECKPOINT_BYTES = 256 * 1024;
+const POSIX_CHECKPOINT_DIRECTORY_MODE = 0o700;
+const POSIX_CHECKPOINT_FILE_MODE = 0o600;
 
 export interface CheckpointOriginal {
   original_goal: string;
@@ -207,7 +212,10 @@ export function resolveCheckpointDirectory(
 }
 
 export class CheckpointStore {
-  constructor(readonly directory = resolveCheckpointDirectory()) {
+  constructor(
+    readonly directory = resolveCheckpointDirectory(),
+    private readonly platform: NodeJS.Platform = process.platform,
+  ) {
     if (!isAbsolute(directory)) {
       throw new Error("Checkpoint directory must be an absolute path");
     }
@@ -215,9 +223,18 @@ export class CheckpointStore {
 
   read(rawThreadId: string): CheckpointDocument | null {
     const threadId = normalizeThreadId(rawThreadId);
+    if (!this.#prepareDirectory(false)) {
+      return null;
+    }
+    const checkpointPath = this.#filePath(threadId);
     let descriptor: number;
     try {
-      descriptor = openSync(this.#filePath(threadId), "r");
+      descriptor = openSync(
+        checkpointPath,
+        this.platform === "win32"
+          ? "r"
+          : constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
     } catch (error) {
       if (isMissingFile(error)) {
         return null;
@@ -227,6 +244,7 @@ export class CheckpointStore {
     const payload = Buffer.allocUnsafe(MAX_CHECKPOINT_BYTES + 1);
     let length = 0;
     try {
+      this.#enforceFileMode(descriptor, checkpointPath);
       while (length < payload.byteLength) {
         const bytesRead = readSync(
           descriptor,
@@ -368,22 +386,95 @@ export class CheckpointStore {
     return join(this.directory, `${key}.json`);
   }
 
+  #prepareDirectory(create: boolean): boolean {
+    if (create) {
+      mkdirSync(this.directory, {
+        recursive: true,
+        mode: POSIX_CHECKPOINT_DIRECTORY_MODE,
+      });
+    }
+    if (this.platform === "win32") {
+      return create || existsSync(this.directory);
+    }
+
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(
+        this.directory,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      if (!fstatSync(descriptor).isDirectory()) {
+        throw new Error("checkpoint path is not a directory");
+      }
+      fchmodSync(descriptor, POSIX_CHECKPOINT_DIRECTORY_MODE);
+      const actualMode = fstatSync(descriptor).mode & 0o777;
+      if (actualMode !== POSIX_CHECKPOINT_DIRECTORY_MODE) {
+        throw new Error(`checkpoint directory mode is ${actualMode.toString(8)}, expected 700`);
+      }
+    } catch (error) {
+      if (!create && isMissingFile(error)) {
+        return false;
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Failed to enforce checkpoint directory mode 0700 for ${this.directory}: ${detail}`,
+        { cause: error },
+      );
+    } finally {
+      if (descriptor !== undefined) {
+        closeSync(descriptor);
+      }
+    }
+    return true;
+  }
+
+  #enforceFileMode(descriptor: number, path: string): void {
+    if (this.platform === "win32") {
+      return;
+    }
+    try {
+      if (!fstatSync(descriptor).isFile()) {
+        throw new Error("checkpoint path is not a regular file");
+      }
+      fchmodSync(descriptor, POSIX_CHECKPOINT_FILE_MODE);
+      const actualMode = fstatSync(descriptor).mode & 0o777;
+      if (actualMode !== POSIX_CHECKPOINT_FILE_MODE) {
+        throw new Error(`checkpoint file mode is ${actualMode.toString(8)}, expected 600`);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Failed to enforce checkpoint file mode 0600 for ${path}: ${detail}`,
+        { cause: error },
+      );
+    }
+  }
+
   #write(checkpoint: CheckpointDocument): void {
-    mkdirSync(this.directory, { recursive: true });
+    this.#prepareDirectory(true);
     const destination = this.#filePath(checkpoint.thread_id);
     const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
     const payload = `${JSON.stringify(checkpoint)}\n`;
     if (Buffer.byteLength(payload, "utf8") > MAX_CHECKPOINT_BYTES) {
       throw new Error("Checkpoint content exceeds the bounded size limit");
     }
+    let descriptor: number | undefined;
     try {
-      writeFileSync(temporary, payload, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
+      descriptor = openSync(
+        temporary,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+        POSIX_CHECKPOINT_FILE_MODE,
+      );
+      this.#enforceFileMode(descriptor, temporary);
+      writeFileSync(descriptor, payload, { encoding: "utf8" });
+      const completedDescriptor = descriptor;
+      descriptor = undefined;
+      closeSync(completedDescriptor);
       renameSync(temporary, destination);
     } finally {
+      if (descriptor !== undefined) {
+        closeSync(descriptor);
+      }
       rmSync(temporary, { force: true });
     }
   }

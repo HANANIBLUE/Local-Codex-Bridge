@@ -1,8 +1,8 @@
 # 更新日志
 
-本文件只记录当前公共仓库 Git 历史中可以核验的事实。当前真正已经公开的最新 tag 是 **V2.1.2**；**V2.2.0** 是尚未创建 tag 或 Release 的目标版本。公共历史中没有单独的 V2.1.0 发布记录。
+本文件只记录当前公共仓库 Git 历史中可以核验的事实。当前发布版本是 **V2.2.0（2026-08-21）**。公共历史中没有单独的 V2.1.0 发布记录。
 
-## V2.2.0（未发布）
+## V2.2.0（2026-08-21）
 
 V2.2.0 聚焦核心 Bridge 的平台兼容、fatal 生命周期和工具契约加固，不包含 macOS 后台服务。macOS LaunchAgent、KeepAlive、watchdog、日志轮转和卸载计划进入未来 V2.3.0。
 
@@ -15,6 +15,7 @@ V2.2.0 聚焦核心 Bridge 的平台兼容、fatal 生命周期和工具契约�
 
 - 核心 Bridge 新增 macOS 支持：Windows 继续接受绝对盘符路径并拒绝 UNC / device path，macOS 接受 POSIX 绝对路径。
 - checkpoint 默认目录按主机平台选择：Windows 使用 `%LOCALAPPDATA%`，macOS 使用 `~/Library/Application Support/LocalCodexBridge/checkpoints`；既有 Windows 兼容逻辑保持不变。
+- POSIX 主机上的 checkpoint 叶目录会被主动收紧并核验为 `0700`，临时文件与最终文件保持 `0600`；Windows 保持功能兼容，但不把 POSIX mode 表述为 Windows ACL 保证。
 - live smoke prompt 在 Windows 使用 PowerShell，在 macOS 使用 POSIX 命令；仍只执行明确授权的真实 Codex smoke 测试。
 - 完整测试入口在非 Windows 主机跳过 Windows Tray 测试，并保留显式 `npm run test:tray` 命令供 Windows 单独验证。
 - GitHub Actions 验证矩阵扩展为 Windows 与 macOS，统一使用 Node.js 24。

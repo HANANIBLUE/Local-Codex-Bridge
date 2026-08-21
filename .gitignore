@@ -9,3 +9,4 @@ npm-debug.log*
 .env
 .env.*
 windows/local-settings.json
+.DS_Store
