@@ -34,7 +34,7 @@ Preserve these distinctions, the tool names, validation, annotations, and stdout
 
 The Bridge is not an OS sandbox and must not claim to be one. Codex permissions come from the official runtime plus the selected sandbox and approval policy. Prompts constrain intended behavior; they do not reduce native process capability by themselves.
 
-Treat thread visibility, the Bridge process environment, and the local OS user as trust boundaries. The app-server child inherits the Bridge environment. Do not add secrets to fixtures, logs, examples, profiles, or command lines, and do not assume transport sanitization provides hostile multi-tenant isolation.
+Treat thread visibility, the Bridge process environment, and the local OS user as trust boundaries. The app-server child receives a newly constructed environment containing the fixed compatibility baseline plus explicitly named passthrough variables, with Tunnel/control-plane credential names hard-denied. Do not add secrets to fixtures, logs, examples, profiles, or command lines, and do not assume transport sanitization provides hostile multi-tenant isolation.
 
 Never fabricate approval or user-input request IDs. A response must match an actually pending request's ID, thread, method, and turn scope. Do not silently widen `cwd` filters into security claims. Avoid stdout diagnostics because stdout is reserved for MCP JSON-RPC; operational diagnostics belong on stderr and still require redaction.
 
