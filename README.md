@@ -66,15 +66,13 @@ Local Codex Bridge
 ### 安装、构建与测试
 
 ```text
-git clone <repository-url>
+git clone https://github.com/HANANIBLUE/Local-Codex-Bridge.git
 cd Local-Codex-Bridge
 npm ci
 npm run typecheck
 npm run build
 npm test
 ```
-
-将 `<repository-url>` 替换为当前 GitHub 仓库的 clone URL。
 
 构建后可在终端直接启动：
 

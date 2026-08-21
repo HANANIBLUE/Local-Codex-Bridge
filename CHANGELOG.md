@@ -2,6 +2,8 @@
 
 本文件只记录当前公共仓库 Git 历史中可以核验的事实。当前发布版本是 **V2.2.0（2026-08-21）**。公共历史中没有单独的 V2.1.0 发布记录。
 
+本项目当前不承诺严格遵循 SemVer 的兼容性规则；兼容性与破坏性变化以本 CHANGELOG 和 GitHub Release 中明确标注的 Breaking Change 为准。
+
 ## V2.2.0（2026-08-21）
 
 V2.2.0 聚焦核心 Bridge 的平台兼容、fatal 生命周期和工具契约加固，不包含 macOS 后台服务。macOS LaunchAgent、KeepAlive、watchdog、日志轮转和卸载计划进入未来 V2.3.0。
