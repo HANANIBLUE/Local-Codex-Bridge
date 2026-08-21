@@ -8,14 +8,14 @@ Local Codex Bridge 能够把 MCP 请求转交给本机 Codex。安全问题可�
 
 ## 私密报告漏洞
 
-如果仓库已启用 GitHub Private Vulnerability Reporting，请在仓库的 **Security** 页面选择 **Report a vulnerability**。不要在公开 Issue 中发布以下内容：
+请通过仓库 **Security** 页面中的 **Report a vulnerability** 私密报告安全问题。不要在公开渠道提交以下内容：
 
-- API key、Tunnel profile、凭据、日志或 checkpoint
-- 可直接复现的破坏性 payload
-- 未公开的本机路径、线程内容或用户数据
-- 绕过 sandbox、approval policy、pending request scope 或敏感信息清理的完整细节
-
-如果私密报告入口尚未启用，请创建一个不含敏感细节的公开 Issue，请维护者提供私密联系方式。
+- API key、token 或其他 credential
+- Tunnel profile
+- checkpoint
+- 日志中的敏感信息
+- 本机私密路径、线程内容或用户数据
+- 可直接利用的完整攻击细节
 
 报告中可以安全包含：受影响版本、操作系统、影响摘要、最小化且已清理的复现条件，以及建议的缓解方式。
 
