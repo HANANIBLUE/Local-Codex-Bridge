@@ -1,15 +1,27 @@
 # 更新日志
 
-本文件只记录当前公共仓库 Git 历史中可以核验的事实。当前公开版本为 **V2.2.0**；公共历史中没有单独的 V2.1.0 发布记录。
+本文件只记录当前公共仓库 Git 历史中可以核验的事实。当前真正已经公开的最新 tag 是 **V2.1.2**；**V2.2.0** 是尚未创建 tag 或 Release 的目标版本。公共历史中没有单独的 V2.1.0 发布记录。
 
-## V2.2.0（2026-08-21）
+## V2.2.0（未发布）
+
+V2.2.0 聚焦核心 Bridge 的平台兼容、fatal 生命周期和工具契约加固，不包含 macOS 后台服务。macOS LaunchAgent、KeepAlive、watchdog、日志轮转和卸载计划进入未来 V2.3.0。
+
+### Breaking Change
+
+- 每次 `codex_turn`（包括 resume）在语义上都必须提供主机原生绝对 `cwd`。
+- `codex_turn` 的 JSON Schema 只把 `text` 列为 `required`，有意识地允许缺少 `cwd` 的请求进入 handler，以返回可恢复的 `input_required` / `cwd_required` 结果；这不表示 `cwd` 真正可选。缺少 `cwd` 时不会调用 app-server 或产生原生 Codex 副作用。
+
+### 加固内容
 
 - 核心 Bridge 新增 macOS 支持：Windows 继续接受绝对盘符路径并拒绝 UNC / device path，macOS 接受 POSIX 绝对路径。
 - checkpoint 默认目录按主机平台选择：Windows 使用 `%LOCALAPPDATA%`，macOS 使用 `~/Library/Application Support/LocalCodexBridge/checkpoints`；既有 Windows 兼容逻辑保持不变。
 - live smoke prompt 在 Windows 使用 PowerShell，在 macOS 使用 POSIX 命令；仍只执行明确授权的真实 Codex smoke 测试。
 - 完整测试入口在非 Windows 主机跳过 Windows Tray 测试，并保留显式 `npm run test:tray` 命令供 Windows 单独验证。
 - GitHub Actions 验证矩阵扩展为 Windows 与 macOS，统一使用 Node.js 24。
-- `codex_turn` 将主机原生绝对 `cwd` 提升为每次调用的显式必填参数；遗漏时返回可重试的 `input_required` 结果，避免先触发普通工具错误再恢复。
+- app-server 出现不可恢复的 spawn、initialize、进程、stdio 或协议 fatal 后，Bridge 会先锁存脱敏 fatal、结束活动 turn 的本地状态、拒绝 Bridge → app-server pending RPC 并清理 pending approval / user-input 请求，再发出一次 fatal 通知；Bridge 不在进程内重启 app-server。
+- MCP 顶层在 fatal 后停止接收新请求，对已经进入处理阶段的请求和响应做最长 1 秒的有界 drain，然后以非零状态退出，使外部监督层能够检测并选择重启整条链。fatal、信号和正常关闭共享幂等关闭协调，正常 stdin EOF、显式 close、SIGINT 和 SIGTERM 不会被标成 app-server fatal。
+- fatal 工具错误尽量返回稳定字段 `error_code: "app_server_fatal"`、`status: "app_server_fatal"`、`recoverable: true`、`bridge_exiting: true` 和 `next_action: "restart_or_reconnect_then_codex_threads"`；该结构化结果属于 best effort，传输先断开时客户端可能只看到断连。
+- 客户端恢复时应先重新建立 Tunnel / MCP 连接，再调用 `codex_threads` 对齐持久状态；不得假设旧回合一定已经停止，因为 Bridge 内存态丢失不等于原生持久状态不存在。
 - 补充 Fork 来源说明以及 MIT、仓库、问题追踪和主页包元数据，公开指向 `HANANIBLUE/Local-Codex-Bridge`。
 - 包版本、Bridge 上游 `clientInfo`、MCP `serverInfo`、测试和公开文档统一为 `2.2.0`。
 - 不捆绑 Codex 运行时、Secure MCP Tunnel 客户端、Tunnel profile、凭据或维护者机器路径；Linux 与 macOS Tray 仍不在支持范围内。
