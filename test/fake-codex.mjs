@@ -104,10 +104,6 @@ lines.on("line", (line) => {
     process.stdout.write("{not valid json\n");
     return;
   }
-  if (message.method === "test/stdout-close") {
-    process.stdout.end();
-    return;
-  }
   if (message.method === "test/threadless") {
     threadlessParentId = message.id;
     send({

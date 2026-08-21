@@ -1,5 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { Writable } from "node:stream";
+import { spawn } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 
 import {
   RuntimeStore,
@@ -12,6 +12,7 @@ const MAX_JSONL_BYTES = 10 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_LATE_RESPONSE_TTL_MS = 60_000;
 const DEFAULT_LATE_RESPONSE_LIMIT = 256;
+const DEFAULT_STDOUT_EXIT_GRACE_MS = 500;
 const MAX_SCOPE_ID_CHARS = 200;
 const THREADLESS_REQUEST_ERROR = {
   code: -32601,
@@ -54,8 +55,54 @@ export interface AppServerLaunchOptions {
   requestTimeoutMs?: number;
   lateResponseTtlMs?: number;
   lateResponseLimit?: number;
+  stdoutExitGraceMs?: number;
+  spawnAppServer?: SpawnAppServer;
   onFatal?: (error: AppServerFatalError) => void;
 }
+
+type AppServerChildEvents = {
+  spawn: [];
+  error: [error: Error];
+  exit: [code: number | null, signal: NodeJS.Signals | null];
+};
+
+export interface AppServerChild {
+  readonly stdin: Writable;
+  readonly stdout: Readable;
+  readonly stderr: Readable;
+  readonly pid?: number | undefined;
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | null;
+  on<Event extends keyof AppServerChildEvents>(
+    event: Event,
+    listener: (...args: AppServerChildEvents[Event]) => void,
+  ): this;
+  once<Event extends keyof AppServerChildEvents>(
+    event: Event,
+    listener: (...args: AppServerChildEvents[Event]) => void,
+  ): this;
+  off<Event extends keyof AppServerChildEvents>(
+    event: Event,
+    listener: (...args: AppServerChildEvents[Event]) => void,
+  ): this;
+  kill(signal?: number | NodeJS.Signals): boolean;
+}
+
+export interface AppServerSpawnOptions {
+  stdio: ["pipe", "pipe", "pipe"];
+  shell: false;
+  windowsHide: true;
+  env: NodeJS.ProcessEnv;
+}
+
+export type SpawnAppServer = (
+  executable: string,
+  args: readonly string[],
+  options: AppServerSpawnOptions,
+) => AppServerChild;
+
+const defaultSpawnAppServer: SpawnAppServer = (executable, args, options) =>
+  spawn(executable, [...args], options);
 
 export interface AppServerFatalPayload {
   error_code: "app_server_fatal";
@@ -188,7 +235,7 @@ export function resolveCodexExecutable(
 }
 
 async function waitForExit(
-  child: ChildProcessWithoutNullStreams,
+  child: AppServerChild,
   timeoutMs: number,
 ): Promise<boolean> {
   if (child.exitCode !== null || child.signalCode !== null) {
@@ -303,12 +350,15 @@ export class AppServerManager {
   readonly #requestTimeoutMs: number;
   readonly #lateResponseTtlMs: number;
   readonly #lateResponseLimit: number;
+  readonly #stdoutExitGraceMs: number;
+  readonly #spawnAppServer: SpawnAppServer;
   readonly #onFatal: ((error: AppServerFatalError) => void) | undefined;
   readonly #pendingCalls = new Map<string, PendingCall>();
   readonly #lateResponses = new Map<string, RetainedLateResponse>();
   readonly #writeLine: (chunk: string) => Promise<void>;
 
-  #child: ChildProcessWithoutNullStreams | null = null;
+  #child: AppServerChild | null = null;
+  #stdoutExitGrace: { child: AppServerChild; timer: NodeJS.Timeout } | null = null;
   #startPromise: Promise<void> | null = null;
   #closePromise: Promise<void> | null = null;
   #childShutdownPromise: Promise<void> | null = null;
@@ -339,6 +389,12 @@ export class AppServerManager {
       DEFAULT_LATE_RESPONSE_LIMIT,
       "lateResponseLimit",
     );
+    this.#stdoutExitGraceMs = positiveIntegerOption(
+      options.stdoutExitGraceMs,
+      DEFAULT_STDOUT_EXIT_GRACE_MS,
+      "stdoutExitGraceMs",
+    );
+    this.#spawnAppServer = options.spawnAppServer ?? defaultSpawnAppServer;
     this.#onFatal = options.onFatal;
     this.#writeLine = createSerializedWriter(async (chunk) => {
       this.#throwIfUnavailable();
@@ -384,9 +440,9 @@ export class AppServerManager {
   }
 
   async #start(): Promise<void> {
-    let child: ChildProcessWithoutNullStreams;
+    let child: AppServerChild;
     try {
-      child = spawn(
+      child = this.#spawnAppServer(
         this.#executable,
         [...this.#prefixArgs, "app-server", "--listen", "stdio://"],
         {
@@ -402,17 +458,13 @@ export class AppServerManager {
       );
     }
 
+    this.#clearStdoutExitGrace();
     this.#child = child;
     child.stdin.on("error", (error) => this.#onStdinError(child, error));
     child.stdin.once("close", () => this.#onStdinClose(child));
     child.stdout.on("data", (chunk: Buffer) => this.#onStdout(chunk));
     child.stdout.once("error", (error) => this.#onStdoutError(child, error));
-    child.stdout.once("close", () => {
-      // A child exit can close stdout just before Node publishes its exit
-      // status. Defer one event-loop turn so the exit handler remains the
-      // canonical fatal source when both describe the same failure.
-      setImmediate(() => this.#onStdoutClose(child));
-    });
+    child.stdout.once("close", () => this.#onStdoutClose(child));
     child.stderr.on("data", () => {
       // Drain without forwarding potentially sensitive child diagnostics.
     });
@@ -755,14 +807,15 @@ export class AppServerManager {
     this.#enterFatal(message);
   }
 
-  #onChildError(child: ChildProcessWithoutNullStreams, error: Error): void {
+  #onChildError(child: AppServerChild, error: Error): void {
+    this.#clearStdoutExitGrace(child);
     if (child !== this.#child || this.#closing) {
       return;
     }
     this.#enterFatal(`Codex app-server process error: ${error.message}`);
   }
 
-  #onStdinError(child: ChildProcessWithoutNullStreams, error: Error): void {
+  #onStdinError(child: AppServerChild, error: Error): void {
     if (child !== this.#child || this.#closing || this.#fatal) {
       return;
     }
@@ -771,7 +824,7 @@ export class AppServerManager {
     );
   }
 
-  #onStdinClose(child: ChildProcessWithoutNullStreams): void {
+  #onStdinClose(child: AppServerChild): void {
     if (
       child !== this.#child ||
       this.#closing ||
@@ -784,7 +837,8 @@ export class AppServerManager {
     this.#protocolFailure("Codex app-server stdin closed unexpectedly");
   }
 
-  #onStdoutError(child: ChildProcessWithoutNullStreams, error: Error): void {
+  #onStdoutError(child: AppServerChild, error: Error): void {
+    this.#clearStdoutExitGrace(child);
     if (child !== this.#child || this.#closing || this.#fatal) {
       return;
     }
@@ -793,21 +847,63 @@ export class AppServerManager {
     );
   }
 
-  #onStdoutClose(child: ChildProcessWithoutNullStreams): void {
-    if (
-      child !== this.#child ||
-      this.#closing ||
-      this.#fatal ||
-      child.exitCode !== null ||
-      child.signalCode !== null
-    ) {
+  #onStdoutClose(child: AppServerChild): void {
+    if (child !== this.#child || this.#closing || this.#fatal) {
+      this.#clearStdoutExitGrace(child);
+      return;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      this.#clearStdoutExitGrace(child);
+      this.#enterExitFatal(child, child.exitCode, child.signalCode);
+      return;
+    }
+    if (this.#stdoutExitGrace?.child === child) {
+      return;
+    }
+    this.#clearStdoutExitGrace();
+    const timer = setTimeout(
+      () => this.#onStdoutExitGrace(child),
+      this.#stdoutExitGraceMs,
+    );
+    timer.unref();
+    this.#stdoutExitGrace = { child, timer };
+  }
+
+  #onStdoutExitGrace(child: AppServerChild): void {
+    if (this.#stdoutExitGrace?.child !== child) {
+      return;
+    }
+    this.#stdoutExitGrace = null;
+    if (child !== this.#child || this.#closing || this.#fatal) {
+      return;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      this.#enterExitFatal(child, child.exitCode, child.signalCode);
       return;
     }
     this.#protocolFailure("Codex app-server stdout closed unexpectedly");
   }
 
+  #clearStdoutExitGrace(child?: AppServerChild): void {
+    const pending = this.#stdoutExitGrace;
+    if (!pending || (child && pending.child !== child)) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.#stdoutExitGrace = null;
+  }
+
   #onExit(
-    child: ChildProcessWithoutNullStreams,
+    child: AppServerChild,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    this.#clearStdoutExitGrace(child);
+    this.#enterExitFatal(child, code, signal);
+  }
+
+  #enterExitFatal(
+    child: AppServerChild,
     code: number | null,
     signal: NodeJS.Signals | null,
   ): void {
@@ -824,6 +920,7 @@ export class AppServerManager {
   }
 
   #enterFatal(message: string): AppServerFatalError {
+    this.#clearStdoutExitGrace();
     if (this.#fatal) {
       return this.#fatal;
     }
@@ -856,6 +953,7 @@ export class AppServerManager {
   async #close(): Promise<void> {
     const shutdownError = this.#normalShutdownError();
     this.#closing = true;
+    this.#clearStdoutExitGrace();
     this.#rejectAll(this.#fatal ?? shutdownError);
     await this.#shutdownChild(1_500);
     this.#child = null;
@@ -869,6 +967,7 @@ export class AppServerManager {
     if (!child) {
       return Promise.resolve();
     }
+    this.#clearStdoutExitGrace(child);
     this.#childShutdownPromise = (async () => {
       if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
         return;

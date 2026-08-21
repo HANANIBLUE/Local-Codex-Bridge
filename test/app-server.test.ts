@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Writable } from "node:stream";
+import { PassThrough, type Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -14,6 +14,7 @@ import {
   AppServerShutdownError,
   createSerializedWriter,
   writeWithBackpressure,
+  type AppServerChild,
 } from "../src/app-server.js";
 import { BridgeLifecycle } from "../src/bridge-lifecycle.js";
 import { ControlSurface, TOOL_DEFINITIONS } from "../src/tools.js";
@@ -38,6 +39,20 @@ async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
       throw new Error(`Timed out waiting for ${filePath}`);
     }
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function waitForCondition(
+  condition: () => boolean,
+  message: string,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) {
+      throw new Error(message);
+    }
+    await delay(1);
   }
 }
 
@@ -75,6 +90,143 @@ class ControlledBackpressureSink extends EventEmitter {
     this.#callback = null;
     callback(error);
   }
+}
+
+class ControlledAppServerChild extends EventEmitter implements AppServerChild {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly pid: number | undefined = 42;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  readonly receivedMethods: string[] = [];
+  initialized = false;
+  exitEvents = 0;
+  killCalls = 0;
+
+  #stdinBuffer = "";
+  #exited = false;
+
+  constructor() {
+    super();
+    this.stdin.on("data", (chunk: Buffer) => this.#onStdin(chunk));
+    this.stdin.once("finish", () => {
+      if (this.exitCode !== null || this.signalCode !== null) {
+        this.emitExit(this.exitCode, this.signalCode);
+      } else {
+        this.emitExit(0, null);
+      }
+    });
+    queueMicrotask(() => this.emit("spawn"));
+  }
+
+  async closeStdout(): Promise<void> {
+    if (this.stdout.destroyed) {
+      return;
+    }
+    const closed = new Promise<void>((resolve) => this.stdout.once("close", resolve));
+    this.stdout.destroy();
+    await closed;
+  }
+
+  setExitState(code: number | null, signal: NodeJS.Signals | null): void {
+    this.exitCode = code;
+    this.signalCode = signal;
+  }
+
+  emitExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.#exited) {
+      return;
+    }
+    this.#exited = true;
+    this.exitCode = code;
+    this.signalCode = signal;
+    this.exitEvents += 1;
+    this.emit("exit", code, signal);
+    this.stdout.destroy();
+    this.stderr.destroy();
+  }
+
+  kill(): boolean {
+    this.killCalls += 1;
+    this.emitExit(null, "SIGTERM");
+    return true;
+  }
+
+  #onStdin(chunk: Buffer): void {
+    this.#stdinBuffer += chunk.toString("utf8");
+    while (true) {
+      const newline = this.#stdinBuffer.indexOf("\n");
+      if (newline < 0) {
+        return;
+      }
+      const line = this.#stdinBuffer.slice(0, newline);
+      this.#stdinBuffer = this.#stdinBuffer.slice(newline + 1);
+      if (!line) {
+        continue;
+      }
+      const message = JSON.parse(line) as Record<string, unknown>;
+      const method = typeof message.method === "string" ? message.method : "";
+      if (method === "initialize") {
+        this.#send({
+          id: message.id,
+          result: {
+            userAgent: "controlled-codex",
+            codexHome: "D:\\fake",
+            platformFamily: "windows",
+            platformOs: "windows",
+          },
+        });
+      } else if (method === "initialized") {
+        this.initialized = true;
+      } else if (method) {
+        this.receivedMethods.push(method);
+      }
+    }
+  }
+
+  #send(message: unknown): void {
+    this.stdout.write(`${JSON.stringify(message)}\n`);
+  }
+}
+
+function createControlledAppServer(
+  fatals: AppServerFatalError[],
+  stdoutExitGraceMs = 40,
+): {
+  manager: AppServerManager;
+  child: () => ControlledAppServerChild;
+} {
+  let spawnedChild: ControlledAppServerChild | undefined;
+  const manager = new AppServerManager(undefined, {
+    executable: "controlled-codex",
+    prefixArgs: ["--controlled-prefix"],
+    requestTimeoutMs: 500,
+    stdoutExitGraceMs,
+    spawnAppServer: (executable, args, options) => {
+      assert.equal(executable, "controlled-codex");
+      assert.deepEqual(args, [
+        "--controlled-prefix",
+        "app-server",
+        "--listen",
+        "stdio://",
+      ]);
+      assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe"]);
+      assert.equal(options.shell, false);
+      assert.equal(options.windowsHide, true);
+      assert.equal(options.env, process.env);
+      spawnedChild = new ControlledAppServerChild();
+      return spawnedChild;
+    },
+    onFatal: (error) => fatals.push(error),
+  });
+  return {
+    manager,
+    child: () => {
+      assert.ok(spawnedChild, "controlled app-server child was not spawned");
+      return spawnedChild;
+    },
+  };
 }
 
 test("control surface starts asynchronously, steers the same turn, uses raw request id, and observes final", async () => {
@@ -148,19 +300,27 @@ test("unexpected app-server death emits one stable fatal and remains latched", a
     executable: process.execPath,
     prefixArgs: [fakeCodex],
     requestTimeoutMs: 2_000,
+    stdoutExitGraceMs: 50,
     onFatal: (error) => fatals.push(error),
   });
   try {
     await assert.rejects(
       manager.request("test/exit", {}),
-      (error: unknown) => error instanceof AppServerFatalError && /exited unexpectedly/.test(error.message),
+      (error: unknown) =>
+        error instanceof AppServerFatalError &&
+        /exited unexpectedly/.test(error.message) &&
+        /code=23/.test(error.message) &&
+        /signal=null/.test(error.message),
     );
+    const fatal = fatals[0];
+    assert.ok(fatal instanceof AppServerFatalError);
     await assert.rejects(
       manager.request("thread/list", {}),
-      (error: unknown) => error === fatals[0],
+      (error: unknown) => error === fatal,
     );
+    await delay(75);
     assert.equal(fatals.length, 1);
-    assert.deepEqual(fatals[0]?.toPayload(), {
+    assert.deepEqual(fatal.toPayload(), {
       error_code: "app_server_fatal",
       status: "app_server_fatal",
       recoverable: true,
@@ -372,22 +532,116 @@ test("protocol fatal rejects every app-server RPC and clears active runtime stat
 
 test("app-server stdout connection closure enters the typed fatal lifecycle", async () => {
   const fatals: AppServerFatalError[] = [];
-  const manager = new AppServerManager(undefined, {
-    executable: process.execPath,
-    prefixArgs: [fakeCodex],
-    requestTimeoutMs: 2_000,
-    onFatal: (error) => fatals.push(error),
-  });
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (error: unknown): void => {
+    unhandledRejections.push(error);
+  };
+  const { manager, child } = createControlledAppServer(fatals, 30);
+  process.on("unhandledRejection", onUnhandledRejection);
   try {
+    await manager.ensureReady();
+    const fakeChild = child();
+    assert.equal(fakeChild.initialized, true);
+    const request = manager.request("test/stdout-close", {});
+    await waitForCondition(
+      () => fakeChild.receivedMethods.includes("test/stdout-close"),
+      "controlled child did not receive test/stdout-close",
+    );
+    await fakeChild.closeStdout();
     await assert.rejects(
-      manager.request("test/stdout-close", {}),
+      request,
       (error: unknown) =>
         error instanceof AppServerFatalError &&
         /stdout closed unexpectedly/.test(error.message),
     );
+    await delay(60);
     assert.equal(fatals.length, 1);
+    assert.doesNotMatch(fatals[0]?.message ?? "", /request timed out/);
+    assert.equal(fakeChild.exitEvents, 1);
+    assert.equal(fakeChild.killCalls, 0);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+    await manager.close();
+  }
+});
+
+test("stdout close followed by exit keeps exit as canonical fatal", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const { manager, child } = createControlledAppServer(fatals, 40);
+  try {
+    await manager.ensureReady();
+    const fakeChild = child();
+    const request = manager.request("test/close-then-exit", {});
+    await waitForCondition(
+      () => fakeChild.receivedMethods.includes("test/close-then-exit"),
+      "controlled child did not receive test/close-then-exit",
+    );
+    await fakeChild.closeStdout();
+    fakeChild.emitExit(23, null);
+    await assert.rejects(
+      request,
+      (error: unknown) =>
+        error instanceof AppServerFatalError &&
+        /exited unexpectedly/.test(error.message) &&
+        /code=23/.test(error.message) &&
+        /signal=null/.test(error.message) &&
+        !/stdout closed unexpectedly/.test(error.message),
+    );
+    await delay(80);
+    assert.equal(fatals.length, 1);
+    assert.equal(fakeChild.exitEvents, 1);
   } finally {
     await manager.close();
+  }
+});
+
+test("normal close cancels pending stdout-exit grace", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const { manager, child } = createControlledAppServer(fatals, 30);
+  await manager.ensureReady();
+  const fakeChild = child();
+  await fakeChild.closeStdout();
+  await manager.close();
+  await delay(60);
+  assert.deepEqual(fatals, []);
+  assert.equal(fakeChild.exitEvents, 1);
+  assert.equal(fakeChild.killCalls, 0);
+});
+
+test("visible exit state makes stdout close use the exit fatal", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const { manager, child } = createControlledAppServer(fatals, 40);
+  try {
+    await manager.ensureReady();
+    const fakeChild = child();
+    const request = manager.request("test/visible-exit-state", {});
+    await waitForCondition(
+      () => fakeChild.receivedMethods.includes("test/visible-exit-state"),
+      "controlled child did not receive test/visible-exit-state",
+    );
+    fakeChild.setExitState(23, null);
+    await fakeChild.closeStdout();
+    await assert.rejects(
+      request,
+      (error: unknown) =>
+        error instanceof AppServerFatalError &&
+        error.message === "Codex app-server exited unexpectedly (code=23, signal=null)",
+    );
+    await delay(80);
+    assert.equal(fatals.length, 1);
+    assert.equal(fakeChild.exitEvents, 0, "visible exit state must not require a synthetic exit event");
+  } finally {
+    await manager.close();
+  }
+});
+
+test("stdout exit grace requires a positive integer", () => {
+  for (const stdoutExitGraceMs of [0, -1, 1.5]) {
+    assert.throws(
+      () => new AppServerManager(undefined, { stdoutExitGraceMs }),
+      /stdoutExitGraceMs must be a positive integer/,
+    );
   }
 });
 
