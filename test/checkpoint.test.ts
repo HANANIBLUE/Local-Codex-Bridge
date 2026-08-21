@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   readFileSync,
   readdirSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -253,5 +256,87 @@ test("checkpoint keeps immutable original plus only previous/current across stor
     assert.equal("events" in stored, false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint actively enforces POSIX leaf and file modes across rotation", {
+  skip: process.platform === "win32",
+}, async () => {
+  const base = mkdtempSync(join(tmpdir(), "local-codex-bridge-checkpoint-mode-test-"));
+  const stateDirectory = join(base, "state");
+  const directory = join(stateDirectory, "checkpoints");
+  const threadId = "019f-checkpoint-permission-thread";
+  const originalUmask = process.umask(0);
+
+  try {
+    mkdirSync(stateDirectory, { mode: 0o755 });
+    const control = new ControlSurface(
+      unavailableAppServer,
+      new CheckpointStore(directory),
+    );
+    await control.call("codex_checkpoint", {
+      action: "update",
+      thread_id: threadId,
+      original_goal: "Protect checkpoint permissions",
+      original_constraints: "Keep the leaf directory and files private",
+      original_acceptance: "POSIX modes are explicit",
+      current_understanding: "Initial write",
+      current_decision: "Verify new paths",
+      acceptance_status: "Pending rotation",
+      next_step: "Rotate checkpoint",
+    });
+
+    assert.equal(statSync(directory).mode & 0o777, 0o700);
+    assert.equal(statSync(stateDirectory).mode & 0o777, 0o755);
+    let files = readdirSync(directory);
+    assert.equal(files.length, 1);
+    const checkpointFileName = files[0]!;
+    const checkpointPath = join(directory, checkpointFileName);
+    assert.equal(statSync(checkpointPath).mode & 0o777, 0o600);
+
+    chmodSync(directory, 0o777);
+    chmodSync(checkpointPath, 0o666);
+    assert.equal(new CheckpointStore(directory).read(threadId)?.thread_id, threadId);
+    assert.equal(statSync(directory).mode & 0o777, 0o700);
+    assert.equal(statSync(checkpointPath).mode & 0o777, 0o600);
+
+    chmodSync(directory, 0o777);
+    await control.call("codex_checkpoint", {
+      action: "update",
+      thread_id: threadId,
+      current_understanding: "Rotated write",
+      current_decision: "Verify existing paths",
+      acceptance_status: "Ready",
+      next_step: "Read checkpoint",
+    });
+
+    assert.equal(statSync(directory).mode & 0o777, 0o700);
+    files = readdirSync(directory);
+    assert.deepEqual(files, [checkpointFileName]);
+    assert.equal(statSync(checkpointPath).mode & 0o777, 0o600);
+  } finally {
+    process.umask(originalUmask);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint refuses a POSIX symlink leaf without chmodding its target", {
+  skip: process.platform === "win32",
+}, () => {
+  const base = mkdtempSync(join(tmpdir(), "local-codex-bridge-checkpoint-link-test-"));
+  const target = join(base, "target");
+  const directory = join(base, "checkpoints");
+
+  try {
+    mkdirSync(target, { mode: 0o777 });
+    chmodSync(target, 0o777);
+    symlinkSync(target, directory, "dir");
+    assert.throws(
+      () => new CheckpointStore(directory).read("019f-checkpoint-symlink-thread"),
+      /Failed to enforce checkpoint directory mode 0700/,
+    );
+    assert.equal(statSync(target).mode & 0o777, 0o777);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
   }
 });

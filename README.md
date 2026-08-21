@@ -6,9 +6,9 @@ Local Codex Bridge 是一个面向 Windows 和 macOS 的轻量 MCP stdio 桥接�
 
 它解决的是一个很具体的问题：ChatGPT 适合对话、拆解目标和持续监督，Codex 则能在本机工作区里使用真实的文件、命令和开发工具。Bridge 在两者之间提供 7 个边界清楚的控制工具，不再额外发明一套任务系统。
 
-## 当前公开版本与目标版本
+## 当前发布版本
 
-当前真正已经公开的最新 tag 是 **V2.1.2**。**V2.2.0** 是尚未发布的目标版本；本仓库当前代码正在为该版本完成发布前加固，尚未创建 `v2.2.0` tag 或 Release。详见[更新日志](CHANGELOG.md)。
+当前发布版本是 **V2.2.0（2026-08-21）**。详见[更新日志](CHANGELOG.md)。
 
 V2.2.0 聚焦核心 Bridge 的平台兼容、fatal 生命周期和工具契约加固：新增 macOS 主机原生路径支持，修复 app-server fatal 后 Bridge 假在线的问题，并让缺少 `cwd` 的调用真正获得可恢复提示。macOS 后台 LaunchAgent 不属于 V2.2.0，计划在未来 V2.3.0 单独设计、实现和验证；可选 Tray 仍仅支持 Windows。
 
@@ -106,6 +106,7 @@ env:     CODEX_EXE=<absolute Codex executable path>   # 可选
 
 - 每次 `codex_turn` 都必须显式传入主机原生绝对 `cwd`，包括恢复既有线程；不知道路径时应先用 `codex_threads` 读取线程或查找对应目录。
 - 若调用方仍遗漏 `cwd`，Bridge 会返回可重试的 `input_required` 结果，不会启动原生线程或回合。
+- `codex_threads.cwd` 是精确筛选条件，不是文件系统权限边界。路径 normalization 只处理路径语法，不等于 `realpath`，也不会统一符号链接或大小写；例如 macOS 上指向同一位置的 `/tmp` 与 `/private/tmp` 可能无法相互匹配。最可靠的做法是复用 Codex 返回记录中的 `cwd`；不确定时，先不带 `cwd` 列出线程，或直接按 `thread_id` 查询。
 - 长时间没有新命令或输出，不足以证明 Codex 卡住了。
 - 只有新证据或用户意图发生变化时才应 steer。
 - 只有确实存在的 pending request 才能 respond。
@@ -114,7 +115,7 @@ env:     CODEX_EXE=<absolute Codex executable path>   # 可选
 
 ### Breaking Change：`codex_turn.cwd`
 
-从目标版本 V2.2.0 开始，每次 `codex_turn` 都在语义上要求提供 `cwd`，包括恢复既有线程。公开 JSON Schema 有意识地只把 `text` 放在 `required` 中；这不表示 `cwd` 真正可选，而是为了让严格 MCP 宿主也能把缺参调用交给 handler，并收到 `status: "input_required"`、`error_code: "cwd_required"` 和先调用 `codex_threads` 的恢复提示。缺少 `cwd` 时不会启动或恢复线程，也不会调用原生 Codex app-server。
+从 V2.2.0 开始，每次 `codex_turn` 都在语义上要求提供 `cwd`，包括恢复既有线程。公开 JSON Schema 有意识地只把 `text` 放在 `required` 中；这不表示 `cwd` 真正可选，而是为了让严格 MCP 宿主也能把缺参调用交给 handler，并收到 `status: "input_required"`、`error_code: "cwd_required"` 和先调用 `codex_threads` 的恢复提示。缺少 `cwd` 时不会启动或恢复线程，也不会调用原生 Codex app-server。
 
 ### app-server fatal 与客户端恢复
 
@@ -220,7 +221,7 @@ Local Codex Bridge 不会创建新的操作系统沙箱。真正的文件、命�
 
 - 原生线程、回合、历史和最终输出由官方 Codex 持久化。
 - Bridge 的事件 ring、活动回合状态和 pending request 只在内存中存在。Bridge 重启后，`codex_observe` 可以回退读取持久历史，但会明确标记实时状态无法重建。
-- Windows 新安装的 checkpoint 默认位于 `%LOCALAPPDATA%\LocalCodexBridge\checkpoints\<sha256(thread_id)>.json`；macOS 默认位于 `~/Library/Application Support/LocalCodexBridge/checkpoints/<sha256(thread_id)>.json`。可用 `LOCAL_CODEX_BRIDGE_CHECKPOINT_DIR` 指定其他绝对目录。Windows 若检测到既有旧默认目录，Bridge 会继续使用它；也可用旧的 `LUMEN_CODEX_V2_CHECKPOINT_DIR` 显式指定，不会自动迁移数据。
+- Windows 新安装的 checkpoint 默认位于 `%LOCALAPPDATA%\LocalCodexBridge\checkpoints\<sha256(thread_id)>.json`；macOS 默认位于 `~/Library/Application Support/LocalCodexBridge/checkpoints/<sha256(thread_id)>.json`。可用 `LOCAL_CODEX_BRIDGE_CHECKPOINT_DIR` 指定其他绝对目录。Windows 若检测到既有旧默认目录，Bridge 会继续使用它；也可用旧的 `LUMEN_CODEX_V2_CHECKPOINT_DIR` 显式指定，不会自动迁移数据。POSIX 主机上的 checkpoint 叶目录会被主动收紧并核验为 `0700`，临时文件和最终文件为 `0600`；这项 POSIX mode 保证不等同于 Windows ACL 保证。
 - app-server fatal 后不会在同一个 Bridge 进程中自动重启；Bridge 会协调关闭并以非零状态退出，使外部监督层能够检测到故障。
 - `cwd` 使用 Bridge 主机的原生绝对路径：Windows 接受盘符路径并拒绝 UNC 或 Windows device path；macOS 接受 POSIX 绝对路径。
 - Windows Tray 仍只支持 Windows，并依赖 Windows PowerShell、Windows Forms 和 WMI/CIM；本项目尚未声明或验证 Linux 支持。
