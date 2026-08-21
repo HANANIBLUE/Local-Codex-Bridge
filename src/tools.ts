@@ -133,7 +133,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           type: "string",
           minLength: 1,
           maxLength: 1000,
-          description: "Absolute host-native cwd. Required for every call, including resume.",
+          description: "Absolute host-native cwd. Semantically required for every call, including resume; Schema permits omission only so the handler can return recoverable input_required guidance.",
         },
         model: {
           type: "string",
@@ -150,7 +150,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         sandbox: sandboxSchema,
         approval_policy: approvalPolicySchema,
       },
-      required: ["text", "cwd"],
+      required: ["text"],
       additionalProperties: false,
     },
     annotations: {

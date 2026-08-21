@@ -54,6 +54,47 @@ export interface AppServerLaunchOptions {
   requestTimeoutMs?: number;
   lateResponseTtlMs?: number;
   lateResponseLimit?: number;
+  onFatal?: (error: AppServerFatalError) => void;
+}
+
+export interface AppServerFatalPayload {
+  error_code: "app_server_fatal";
+  status: "app_server_fatal";
+  recoverable: true;
+  bridge_exiting: true;
+  next_action: "restart_or_reconnect_then_codex_threads";
+  message: string;
+}
+
+export class AppServerShutdownError extends Error {
+  constructor(message = "Codex app-server manager is shutting down") {
+    super(message);
+    this.name = "AppServerShutdownError";
+  }
+}
+
+export class AppServerFatalError extends Error {
+  readonly error_code = "app_server_fatal" as const;
+  readonly status = "app_server_fatal" as const;
+  readonly recoverable = true as const;
+  readonly bridge_exiting = true as const;
+  readonly next_action = "restart_or_reconnect_then_codex_threads" as const;
+
+  constructor(message: string) {
+    super(redactText(message));
+    this.name = "AppServerFatalError";
+  }
+
+  toPayload(): AppServerFatalPayload {
+    return {
+      error_code: this.error_code,
+      status: this.status,
+      recoverable: this.recoverable,
+      bridge_exiting: this.bridge_exiting,
+      next_action: this.next_action,
+      message: this.message,
+    };
+  }
 }
 
 function rpcKey(id: RpcId): string {
@@ -262,6 +303,7 @@ export class AppServerManager {
   readonly #requestTimeoutMs: number;
   readonly #lateResponseTtlMs: number;
   readonly #lateResponseLimit: number;
+  readonly #onFatal: ((error: AppServerFatalError) => void) | undefined;
   readonly #pendingCalls = new Map<string, PendingCall>();
   readonly #lateResponses = new Map<string, RetainedLateResponse>();
   readonly #writeLine: (chunk: string) => Promise<void>;
@@ -269,7 +311,10 @@ export class AppServerManager {
   #child: ChildProcessWithoutNullStreams | null = null;
   #startPromise: Promise<void> | null = null;
   #closePromise: Promise<void> | null = null;
-  #fatal: Error | null = null;
+  #childShutdownPromise: Promise<void> | null = null;
+  #fatal: AppServerFatalError | null = null;
+  #shutdownError: AppServerShutdownError | null = null;
+  #fatalNotified = false;
   #closing = false;
   #initialized = false;
   #nextRequestId = 1;
@@ -294,11 +339,11 @@ export class AppServerManager {
       DEFAULT_LATE_RESPONSE_LIMIT,
       "lateResponseLimit",
     );
+    this.#onFatal = options.onFatal;
     this.#writeLine = createSerializedWriter(async (chunk) => {
+      this.#throwIfUnavailable();
       const child = this.#child;
       if (
-        this.#closing ||
-        this.#fatal ||
         !child ||
         child.exitCode !== null ||
         child.signalCode !== null
@@ -320,14 +365,7 @@ export class AppServerManager {
   }
 
   async ensureReady(): Promise<void> {
-    if (this.#closing) {
-      throw new Error("Codex app-server manager is closing");
-    }
-    if (this.#fatal) {
-      throw new Error(
-        `Codex app-server is unavailable and will not be auto-restarted: ${this.#fatal.message}`,
-      );
-    }
+    this.#throwIfUnavailable();
     if (this.#initialized && this.#child) {
       return;
     }
@@ -359,18 +397,28 @@ export class AppServerManager {
         },
       );
     } catch (error) {
-      this.#fatal = new Error(
-        `Failed to spawn ${this.#executable}: ${redactText(messageFromUnknown(error))}`,
+      throw this.#enterFatal(
+        `Failed to spawn ${this.#executable}: ${messageFromUnknown(error)}`,
       );
-      throw this.#fatal;
     }
 
     this.#child = child;
     child.stdin.on("error", (error) => this.#onStdinError(child, error));
     child.stdin.once("close", () => this.#onStdinClose(child));
     child.stdout.on("data", (chunk: Buffer) => this.#onStdout(chunk));
+    child.stdout.once("error", (error) => this.#onStdoutError(child, error));
+    child.stdout.once("close", () => {
+      // A child exit can close stdout just before Node publishes its exit
+      // status. Defer one event-loop turn so the exit handler remains the
+      // canonical fatal source when both describe the same failure.
+      setImmediate(() => this.#onStdoutClose(child));
+    });
     child.stderr.on("data", () => {
       // Drain without forwarding potentially sensitive child diagnostics.
+    });
+    child.stderr.on("error", () => {
+      // stderr is diagnostics-only. Drain stream errors so they cannot bypass
+      // the app-server lifecycle through an unhandled EventEmitter error.
     });
     child.once("exit", (code, signal) => this.#onExit(child, code, signal));
 
@@ -388,6 +436,7 @@ export class AppServerManager {
         child.once("error", onError);
       });
       child.on("error", (error) => this.#onChildError(child, error));
+      this.#throwIfUnavailable();
 
       await this.#request(
         "initialize",
@@ -406,24 +455,32 @@ export class AppServerManager {
         },
         30_000,
       );
+      this.#throwIfUnavailable();
       await this.#write({ method: "initialized", params: {} });
+      this.#throwIfUnavailable();
       this.#initialized = true;
     } catch (error) {
-      const failure =
-        this.#fatal ??
-        new Error(`Codex app-server initialization failed: ${redactText(messageFromUnknown(error))}`);
-      this.#fatal = failure;
-      if (child.exitCode === null && child.signalCode === null) {
-        child.stdin.end();
-        if (!(await waitForExit(child, 500))) {
-          child.kill();
-        }
+      if (this.#fatal) {
+        await this.#shutdownChild(500);
+        throw this.#fatal;
       }
+      if (error instanceof AppServerFatalError) {
+        await this.#shutdownChild(500);
+        throw error;
+      }
+      if (this.#closing && error instanceof AppServerShutdownError) {
+        throw error;
+      }
+      const failure = this.#enterFatal(
+        `Codex app-server initialization failed: ${messageFromUnknown(error)}`,
+      );
+      await this.#shutdownChild(500);
       throw failure;
     }
   }
 
   #request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
+    this.#throwIfUnavailable();
     const id = this.#nextRequestId;
     this.#nextRequestId += 1;
     const key = rpcKey(id);
@@ -447,11 +504,21 @@ export class AppServerManager {
         }
         clearTimeout(pending.timer);
         this.#pendingCalls.delete(key);
-        pending.reject(
-          new Error(`Failed to write app-server request ${method}: ${messageFromUnknown(error)}`),
-        );
+        pending.reject(this.#requestWriteFailure(method, error));
       });
     });
+  }
+
+  #requestWriteFailure(method: string, error: unknown): Error {
+    if (this.#fatal) {
+      return this.#fatal;
+    }
+    if (error instanceof AppServerShutdownError || error instanceof AppServerFatalError) {
+      return error;
+    }
+    return new Error(
+      `Failed to write app-server request ${method}: ${messageFromUnknown(error)}`,
+    );
   }
 
   #retainLateResponse(key: string, candidate: LateResponseCandidate): void {
@@ -555,7 +622,36 @@ export class AppServerManager {
 
   async #write(message: unknown): Promise<void> {
     const encoded = `${JSON.stringify(message)}\n`;
-    await this.#writeLine(encoded);
+    try {
+      await this.#writeLine(encoded);
+    } catch (error) {
+      if (this.#fatal) {
+        throw this.#fatal;
+      }
+      if (error instanceof AppServerShutdownError || error instanceof AppServerFatalError) {
+        throw error;
+      }
+      if (this.#closing) {
+        throw this.#normalShutdownError();
+      }
+      throw this.#enterFatal(
+        `Codex app-server stdin write failed: ${messageFromUnknown(error)}`,
+      );
+    }
+  }
+
+  #normalShutdownError(): AppServerShutdownError {
+    this.#shutdownError ??= new AppServerShutdownError();
+    return this.#shutdownError;
+  }
+
+  #throwIfUnavailable(): void {
+    if (this.#fatal) {
+      throw this.#fatal;
+    }
+    if (this.#closing) {
+      throw this.#normalShutdownError();
+    }
   }
 
   #onStdout(chunk: Buffer): void {
@@ -656,31 +752,14 @@ export class AppServerManager {
   }
 
   #protocolFailure(message: string): void {
-    if (this.#fatal) {
-      return;
-    }
-    this.#fatal = new Error(redactText(message));
-    this.runtime.markAppServerExited(this.#fatal.message);
-    this.#rejectAll(this.#fatal);
-    const child = this.#child;
-    if (child && child.exitCode === null && child.signalCode === null) {
-      child.stdin.end();
-      const timer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill();
-        }
-      }, 500);
-      timer.unref();
-    }
+    this.#enterFatal(message);
   }
 
   #onChildError(child: ChildProcessWithoutNullStreams, error: Error): void {
     if (child !== this.#child || this.#closing) {
       return;
     }
-    this.#fatal = new Error(`Codex app-server process error: ${redactText(error.message)}`);
-    this.runtime.markAppServerExited(this.#fatal.message);
-    this.#rejectAll(this.#fatal);
+    this.#enterFatal(`Codex app-server process error: ${error.message}`);
   }
 
   #onStdinError(child: ChildProcessWithoutNullStreams, error: Error): void {
@@ -705,6 +784,28 @@ export class AppServerManager {
     this.#protocolFailure("Codex app-server stdin closed unexpectedly");
   }
 
+  #onStdoutError(child: ChildProcessWithoutNullStreams, error: Error): void {
+    if (child !== this.#child || this.#closing || this.#fatal) {
+      return;
+    }
+    this.#protocolFailure(
+      `Codex app-server stdout failed: ${messageFromUnknown(error)}`,
+    );
+  }
+
+  #onStdoutClose(child: ChildProcessWithoutNullStreams): void {
+    if (
+      child !== this.#child ||
+      this.#closing ||
+      this.#fatal ||
+      child.exitCode !== null ||
+      child.signalCode !== null
+    ) {
+      return;
+    }
+    this.#protocolFailure("Codex app-server stdout closed unexpectedly");
+  }
+
   #onExit(
     child: ChildProcessWithoutNullStreams,
     code: number | null,
@@ -717,12 +818,30 @@ export class AppServerManager {
     if (this.#closing) {
       return;
     }
-    const failure = new Error(
+    this.#enterFatal(
       `Codex app-server exited unexpectedly (code=${String(code)}, signal=${String(signal)})`,
     );
+  }
+
+  #enterFatal(message: string): AppServerFatalError {
+    if (this.#fatal) {
+      return this.#fatal;
+    }
+    const failure = new AppServerFatalError(message);
     this.#fatal = failure;
     this.runtime.markAppServerExited(failure.message);
     this.#rejectAll(failure);
+    void this.#shutdownChild(500);
+    if (!this.#fatalNotified) {
+      this.#fatalNotified = true;
+      try {
+        this.#onFatal?.(failure);
+      } catch {
+        // The manager owns local fatal cleanup. Top-level shutdown remains
+        // best effort and callback failures must not replace the root cause.
+      }
+    }
+    return failure;
   }
 
   #rejectAll(error: Error): void {
@@ -735,19 +854,31 @@ export class AppServerManager {
   }
 
   async #close(): Promise<void> {
+    const shutdownError = this.#normalShutdownError();
     this.#closing = true;
+    this.#rejectAll(this.#fatal ?? shutdownError);
+    await this.#shutdownChild(1_500);
+    this.#child = null;
+  }
+
+  #shutdownChild(graceMs: number): Promise<void> {
+    if (this.#childShutdownPromise) {
+      return this.#childShutdownPromise;
+    }
     const child = this.#child;
     if (!child) {
-      return;
+      return Promise.resolve();
     }
-    this.#rejectAll(new Error("Codex app-server manager is shutting down"));
-    if (child.exitCode === null && child.signalCode === null) {
+    this.#childShutdownPromise = (async () => {
+      if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+        return;
+      }
       child.stdin.end();
-      if (!(await waitForExit(child, 1_500))) {
+      if (!(await waitForExit(child, graceMs))) {
         child.kill();
         await waitForExit(child, 1_000);
       }
-    }
-    this.#child = null;
+    })();
+    return this.#childShutdownPromise;
   }
 }
