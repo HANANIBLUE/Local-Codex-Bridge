@@ -1,3 +1,6 @@
+import type { Readable, Writable } from "node:stream";
+
+import { AppServerFatalError } from "./app-server.js";
 import { sanitizeForTransport, type RpcId } from "./runtime.js";
 import { ControlSurface, TOOL_DEFINITIONS, TOOL_NAMES } from "./tools.js";
 
@@ -11,6 +14,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = new Set([
   "2024-10-07",
 ]);
 const MAX_LINE_BYTES = 10 * 1024 * 1024;
+export const FATAL_DRAIN_TIMEOUT_MS = 1_000;
 
 interface RpcError {
   code: number;
@@ -105,6 +109,9 @@ function initializeMismatch(
 
 export interface McpStdioServerOptions {
   onClose: () => void | Promise<void>;
+  onError?: (error: unknown) => void;
+  input?: Readable;
+  output?: Writable;
 }
 
 export class McpStdioServer {
@@ -113,38 +120,50 @@ export class McpStdioServer {
   readonly #requestControllers = new Map<string, AbortController>();
   readonly #control: ControlSurface;
   readonly #onClose: () => void | Promise<void>;
+  readonly #onError: ((error: unknown) => void) | undefined;
+  readonly #input: Readable;
+  readonly #output: Writable;
+  readonly #idleWaiters = new Set<() => void>();
 
   #buffer = Buffer.alloc(0);
   #initializeResult: Record<string, unknown> | null = null;
   #initializeCompatibility: InitializeCompatibility | null = null;
   #closing = false;
+  #fatalOutputClosed = false;
+  #closePromise: Promise<void> | null = null;
   #writeChain: Promise<void> = Promise.resolve();
 
   constructor(control: ControlSurface, options: McpStdioServerOptions) {
     this.#control = control;
     this.#onClose = options.onClose;
+    this.#onError = options.onError;
+    this.#input = options.input ?? process.stdin;
+    this.#output = options.output ?? process.stdout;
   }
 
   start(): void {
-    process.stdin.on("data", this.#onData);
-    process.stdin.once("end", this.#onInputClose);
-    process.stdin.once("close", this.#onInputClose);
-    process.stdin.once("error", this.#onInputError);
-    process.stdin.resume();
+    this.#input.on("data", this.#onData);
+    this.#input.once("end", this.#onInputClose);
+    this.#input.once("close", this.#onInputClose);
+    this.#input.once("error", this.#onInputError);
+    this.#input.resume();
   }
 
   async close(): Promise<void> {
-    if (this.#closing) {
-      return;
+    if (!this.#closePromise) {
+      this.#closePromise = this.#close(false, 0);
     }
-    this.#closing = true;
-    this.#abortActiveRequests();
-    process.stdin.off("data", this.#onData);
-    process.stdin.off("end", this.#onInputClose);
-    process.stdin.off("close", this.#onInputClose);
-    process.stdin.off("error", this.#onInputError);
-    process.stdin.pause();
-    await this.#writeChain.catch(() => undefined);
+    await this.#closePromise;
+  }
+
+  async closeAfterFatal(timeoutMs = FATAL_DRAIN_TIMEOUT_MS): Promise<void> {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10_000) {
+      throw new Error("fatal drain timeout must be an integer from 1 to 10000 milliseconds");
+    }
+    if (!this.#closePromise) {
+      this.#closePromise = this.#close(true, timeoutMs);
+    }
+    await this.#closePromise;
   }
 
   readonly #onData = (chunk: Buffer): void => {
@@ -234,11 +253,19 @@ export class McpStdioServer {
     const controller = new AbortController();
     this.#activeRequests.add(key);
     this.#requestControllers.set(key, controller);
-    void this.#handleRequest(record.id, record.method, record.params, controller.signal).finally(() => {
-      this.#activeRequests.delete(key);
-      this.#requestControllers.delete(key);
-      this.#cancelled.delete(key);
-    });
+    void this.#handleRequest(record.id, record.method, record.params, controller.signal)
+      .catch((error: unknown) => this.#handleRequestTaskError(error))
+      .finally(() => {
+        this.#activeRequests.delete(key);
+        this.#requestControllers.delete(key);
+        this.#cancelled.delete(key);
+        if (this.#activeRequests.size === 0) {
+          for (const resolve of this.#idleWaiters) {
+            resolve();
+          }
+          this.#idleWaiters.clear();
+        }
+      });
   }
 
   #handleNotification(method: string, params: unknown): void {
@@ -341,11 +368,14 @@ export class McpStdioServer {
         ],
       });
     } catch (error) {
+      const payload = error instanceof AppServerFatalError
+        ? { error: error.message, ...error.toPayload() }
+        : { error: safeErrorMessage(error) };
       await this.#sendResult(id, {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ error: safeErrorMessage(error) }),
+            text: JSON.stringify(payload),
           },
         ],
         isError: true,
@@ -382,14 +412,93 @@ export class McpStdioServer {
     }
   }
 
+  async #close(drainActive: boolean, timeoutMs: number): Promise<void> {
+    this.#closing = true;
+    this.#input.off("data", this.#onData);
+    this.#input.off("end", this.#onInputClose);
+    this.#input.off("close", this.#onInputClose);
+    this.#input.off("error", this.#onInputError);
+    this.#input.pause();
+
+    if (!drainActive) {
+      this.#abortActiveRequests();
+      await this.#writeChain.catch(() => undefined);
+      return;
+    }
+
+    const drained = await this.#waitWithin(
+      Promise.all([
+        this.#waitForActiveRequests(),
+        this.#writeChain.catch(() => undefined),
+      ]).then(() => undefined),
+      timeoutMs,
+    );
+    if (!drained) {
+      this.#abortActiveRequests();
+      for (const resolve of this.#idleWaiters) {
+        resolve();
+      }
+      this.#idleWaiters.clear();
+      if (!this.#output.destroyed) {
+        this.#fatalOutputClosed = true;
+        this.#output.destroy();
+      }
+    }
+  }
+
+  #waitForActiveRequests(): Promise<void> {
+    if (this.#activeRequests.size === 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.#idleWaiters.add(resolve);
+    });
+  }
+
+  async #waitWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  #handleRequestTaskError(error: unknown): void {
+    if (this.#fatalOutputClosed && this.#output.destroyed) {
+      return;
+    }
+    if (this.#onError) {
+      try {
+        this.#onError(error);
+        return;
+      } catch (callbackError) {
+        queueMicrotask(() => {
+          throw callbackError;
+        });
+        return;
+      }
+    }
+    queueMicrotask(() => {
+      throw error;
+    });
+  }
+
   async #write(message: unknown): Promise<void> {
     const payload = `${JSON.stringify(message)}\n`;
     const write = async (): Promise<void> => {
-      if (!process.stdout.writable) {
+      if (!this.#output.writable) {
         throw new Error("MCP stdout is not writable");
       }
       await new Promise<void>((resolve, reject) => {
-        process.stdout.write(payload, "utf8", (error?: Error | null) => {
+        this.#output.write(payload, "utf8", (error?: Error | null) => {
           if (error) {
             reject(error);
           } else {

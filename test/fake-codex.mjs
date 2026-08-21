@@ -100,6 +100,10 @@ lines.on("line", (line) => {
   if (message.method === "test/exit") {
     process.exit(23);
   }
+  if (message.method === "test/protocol-failure") {
+    process.stdout.write("{not valid json\n");
+    return;
+  }
   if (message.method === "test/threadless") {
     threadlessParentId = message.id;
     send({

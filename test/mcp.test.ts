@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import type { AppServerManager } from "../src/app-server.js";
+import { AppServerFatalError, type AppServerManager } from "../src/app-server.js";
 import { CHECKPOINT_DIRECTORY_ENV } from "../src/checkpoint.js";
 import { McpStdioServer } from "../src/mcp.js";
 import { RuntimeStore } from "../src/runtime.js";
@@ -21,16 +22,20 @@ class TestClient {
   readonly #pending = new Map<string, (message: Record<string, unknown>) => void>();
   readonly #unclaimed: Record<string, unknown>[] = [];
   #buffer = "";
+  stdoutOutput = "";
+  stderrOutput = "";
 
-  constructor(environment: NodeJS.ProcessEnv = process.env) {
+  constructor(environment: NodeJS.ProcessEnv = process.env, cwd?: string) {
     const entry = fileURLToPath(new URL("../src/index.js", import.meta.url));
     this.child = spawn(process.execPath, [entry], {
       env: environment,
+      ...(cwd ? { cwd } : {}),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => {
+      this.stdoutOutput += chunk;
       this.#buffer += chunk;
       while (true) {
         const newline = this.#buffer.indexOf("\n");
@@ -51,6 +56,10 @@ class TestClient {
           }
         }
       }
+    });
+    this.child.stderr.setEncoding("utf8");
+    this.child.stderr.on("data", (chunk: string) => {
+      this.stderrOutput += chunk;
     });
   }
 
@@ -79,18 +88,73 @@ class TestClient {
     return this.#unclaimed.splice(0);
   }
 
-  async close(): Promise<number | null> {
-    this.child.stdin.end();
+  endInput(): void {
+    if (this.child.stdin.writable) {
+      this.child.stdin.end();
+    }
+  }
+
+  async waitForExit(timeoutMs = 5_000): Promise<number | null> {
+    if (this.child.exitCode !== null || this.child.signalCode !== null) {
+      return this.child.exitCode;
+    }
     return await new Promise<number | null>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.child.kill();
-        reject(new Error("MCP server did not exit after stdin EOF"));
-      }, 3_000);
+        reject(new Error("MCP server did not exit within the test deadline"));
+      }, timeoutMs);
       this.child.once("exit", (code) => {
         clearTimeout(timer);
         resolve(code);
       });
     });
+  }
+
+  async close(): Promise<number | null> {
+    this.endInput();
+    return await this.waitForExit(3_000);
+  }
+}
+
+async function waitForFile(filePath: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(filePath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${filePath}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function writeFakeAppServer(directory: string, source: string): void {
+  writeFileSync(join(directory, "app-server"), source, "utf8");
+}
+
+class BlockingSecondWrite extends Writable {
+  readonly chunks: string[] = [];
+  destroyCalls = 0;
+  #pendingWrite: ((error?: Error | null) => void) | undefined;
+
+  override _write(
+    chunk: Buffer,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
+    this.chunks.push(chunk.toString("utf8"));
+    if (this.chunks.length === 1) {
+      callback();
+      return;
+    }
+    this.#pendingWrite = callback;
+    this.emit("blocked");
+  }
+
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+    this.destroyCalls += 1;
+    const pending = this.#pendingWrite;
+    this.#pendingWrite = undefined;
+    pending?.(new Error("output intentionally closed after fatal drain timeout"));
+    callback(error);
   }
 }
 
@@ -205,6 +269,17 @@ test("MCP stdio initializes idempotently and lists exactly seven fully annotated
       (respondTool?.annotations as Record<string, unknown>).idempotentHint,
       false,
     );
+    const turnTool = tools.find((tool) => tool.name === "codex_turn");
+    assert.deepEqual(
+      (turnTool?.inputSchema as Record<string, unknown>).required,
+      ["text"],
+    );
+    const turnProperties = (turnTool?.inputSchema as Record<string, unknown>)
+      .properties as Record<string, Record<string, unknown>>;
+    assert.match(
+      turnProperties.cwd?.description as string,
+      /Semantically required for every call, including resume/,
+    );
     const checkpointTool = tools.find((tool) => tool.name === "codex_checkpoint");
     assert.match(
       checkpointTool?.description as string,
@@ -241,6 +316,365 @@ test("MCP returns missing codex_turn cwd as recoverable data instead of a tool e
     });
   } finally {
     assert.equal(await client.close(), 0);
+  }
+});
+
+test("MCP framing reaches missing-cwd recovery without any app-server request", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let appServerRequests = 0;
+  const appServer = {
+    runtime: new RuntimeStore(),
+    async request(): Promise<never> {
+      appServerRequests += 1;
+      throw new Error("app-server must not be called for missing cwd");
+    },
+  } as unknown as AppServerManager;
+  const server = new McpStdioServer(new ControlSurface(appServer), {
+    onClose: () => undefined,
+    input,
+    output,
+  });
+  const messages: Record<string, unknown>[] = [];
+  const waiters: Array<(message: Record<string, unknown>) => void> = [];
+  let buffer = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    buffer += chunk;
+    while (true) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      const line = buffer.slice(0, newline).replace(/\r$/, "");
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      const message = JSON.parse(line) as Record<string, unknown>;
+      const waiter = waiters.shift();
+      if (waiter) waiter(message);
+      else messages.push(message);
+    }
+  });
+  const nextMessage = (): Promise<Record<string, unknown>> => {
+    const message = messages.shift();
+    return message
+      ? Promise.resolve(message)
+      : new Promise((resolve) => waiters.push(resolve));
+  };
+  const send = (id: RpcId, method: string, params: unknown): void => {
+    input.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+  };
+
+  try {
+    server.start();
+    send(1, "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "framing-test", version: "1" },
+    });
+    assert.equal((await nextMessage()).error, undefined);
+    send(2, "tools/call", {
+      name: "codex_turn",
+      arguments: { text: "recover before native work" },
+    });
+    const response = await nextMessage();
+    assert.equal((response.result as Record<string, unknown>).isError, undefined);
+    assert.equal(toolPayload(response).status, "input_required");
+    assert.equal(toolPayload(response).error_code, "cwd_required");
+    assert.equal(appServerRequests, 0);
+  } finally {
+    await server.close();
+    input.destroy();
+    output.destroy();
+  }
+});
+
+test("real Bridge entry drains a typed fatal response and exits with code 1", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "local-codex-bridge-entry-fatal-"));
+  const canary = "SUBPROCESS_FATAL_SECRET_CANARY";
+  writeFakeAppServer(temporaryDirectory, `
+const readline = require("node:readline");
+if (process.argv.slice(2).join(" ") !== "--listen stdio://") process.exit(64);
+const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    process.stdout.write(JSON.stringify({ id: message.id, result: { userAgent: "entry-fatal-test" } }) + "\\n");
+    return;
+  }
+  if (message.method === "thread/list") {
+    process.stdout.end("api_key=${canary}\\n");
+  }
+});
+lines.on("close", () => process.exit(0));
+`);
+  const client = new TestClient({
+    ...process.env,
+    CODEX_EXE: process.execPath,
+  }, temporaryDirectory);
+  try {
+    await initialize(client, 1);
+    const response = await client.request(2, "tools/call", {
+      name: "codex_threads",
+      arguments: {},
+    });
+    const payload = toolPayload(response);
+    assert.equal((response.result as Record<string, unknown>).isError, true);
+    assert.equal(payload.status, "app_server_fatal");
+    assert.equal(payload.error_code, "app_server_fatal");
+    assert.equal(payload.recoverable, true);
+    assert.equal(payload.bridge_exiting, true);
+    assert.equal(payload.next_action, "restart_or_reconnect_then_codex_threads");
+    assert.equal(await client.waitForExit(), 1);
+    assert.doesNotMatch(`${client.stdoutOutput}\n${client.stderrOutput}`, new RegExp(canary));
+  } finally {
+    if (client.child.exitCode === null && client.child.signalCode === null) {
+      await client.close().catch(() => undefined);
+    }
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("real Bridge entry treats stdin EOF during pending initialize as normal exit", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "local-codex-bridge-entry-eof-"));
+  const markerPath = join(temporaryDirectory, "initialize-pending");
+  writeFakeAppServer(temporaryDirectory, `
+const fs = require("node:fs");
+const readline = require("node:readline");
+if (process.argv.slice(2).join(" ") !== "--listen stdio://") process.exit(64);
+const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    fs.writeFileSync("initialize-pending", "pending\\n", "utf8");
+  }
+});
+lines.on("close", () => process.exit(0));
+`);
+  const client = new TestClient({
+    ...process.env,
+    CODEX_EXE: process.execPath,
+  }, temporaryDirectory);
+  try {
+    await initialize(client, 1);
+    client.writeRaw(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "codex_threads", arguments: {} },
+    })}\n`);
+    await waitForFile(markerPath);
+    client.endInput();
+    assert.equal(await client.waitForExit(), 0);
+    assert.doesNotMatch(client.stdoutOutput, /app_server_fatal/);
+    assert.doesNotMatch(client.stderrOutput, /app_server_fatal/);
+  } finally {
+    if (client.child.exitCode === null && client.child.signalCode === null) {
+      await client.close().catch(() => undefined);
+    }
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("fatal MCP drain with no active request completes without forcing output closed", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const server = new McpStdioServer({} as ControlSurface, {
+    onClose: () => undefined,
+    input,
+    output,
+  });
+  try {
+    const startedAt = Date.now();
+    await server.closeAfterFatal(1_000);
+    assert.ok(Date.now() - startedAt < 500, "idle fatal drain should not wait for its deadline");
+    assert.equal(output.destroyed, false);
+  } finally {
+    await server.close();
+    input.destroy();
+    output.destroy();
+  }
+});
+
+test("fatal MCP tool errors drain a stable best-effort response before close", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let rejectTool: ((error: Error) => void) | undefined;
+  const control = {
+    call(): Promise<unknown> {
+      return new Promise((_resolve, reject) => {
+        rejectTool = reject;
+      });
+    },
+  } as unknown as ControlSurface;
+  const server = new McpStdioServer(control, {
+    onClose: () => undefined,
+    input,
+    output,
+  });
+  const lines: string[] = [];
+  let buffer = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    buffer += chunk;
+    while (true) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      lines.push(buffer.slice(0, newline).replace(/\r$/, ""));
+      buffer = buffer.slice(newline + 1);
+    }
+  });
+
+  try {
+    server.start();
+    input.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "fatal-drain-test", version: "1" },
+      },
+    })}\n`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    input.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "codex_threads", arguments: {} },
+    })}\n`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const closing = server.closeAfterFatal(500);
+    rejectTool?.(new AppServerFatalError("fatal api_key=must-not-leak"));
+    await closing;
+
+    const responses = lines.filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+    const fatalResponse = responses.find((response) => response.id === 2);
+    assert.ok(fatalResponse);
+    assert.equal((fatalResponse.result as Record<string, unknown>).isError, true);
+    assert.deepEqual(toolPayload(fatalResponse), {
+      error: "fatal api_key=[REDACTED]",
+      error_code: "app_server_fatal",
+      status: "app_server_fatal",
+      recoverable: true,
+      bridge_exiting: true,
+      next_action: "restart_or_reconnect_then_codex_threads",
+      message: "fatal api_key=[REDACTED]",
+    });
+  } finally {
+    await server.close();
+    input.destroy();
+    output.destroy();
+  }
+});
+
+test("unexpected MCP request write rejection is reported through onError", async () => {
+  const input = new PassThrough();
+  const output = new BlockingSecondWrite();
+  let reportError: (error: unknown) => void;
+  const reported = new Promise<unknown>((resolve) => {
+    reportError = resolve;
+  });
+  const control = {
+    async call(): Promise<unknown> {
+      return { result: true };
+    },
+  } as unknown as ControlSurface;
+  const server = new McpStdioServer(control, {
+    onClose: () => undefined,
+    onError: (error) => reportError(error),
+    input,
+    output,
+  });
+  try {
+    server.start();
+    input.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "unexpected-write-test", version: "1" },
+      },
+    })}\n`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const blockedWrite = once(output, "blocked");
+    input.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "codex_threads", arguments: {} },
+    })}\n`);
+    await blockedWrite;
+    output.destroy();
+    const error = await reported;
+    assert.match(String(error), /MCP stdout is not writable|output intentionally closed/);
+  } finally {
+    await server.close();
+    input.destroy();
+    output.destroy();
+  }
+});
+
+test("fatal MCP drain consumes a blocked late write and is idempotent with normal close", async () => {
+  const input = new PassThrough();
+  const output = new BlockingSecondWrite();
+  const backgroundErrors: unknown[] = [];
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (error: unknown): void => {
+    unhandledRejections.push(error);
+  };
+  const control = {
+    async call(): Promise<unknown> {
+      return { late: true };
+    },
+  } as unknown as ControlSurface;
+  const server = new McpStdioServer(control, {
+    onClose: () => undefined,
+    onError: (error) => backgroundErrors.push(error),
+    input,
+    output,
+  });
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    server.start();
+    input.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "bounded-drain-test", version: "1" },
+      },
+    })}\n`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const blockedWrite = once(output, "blocked");
+    input.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "codex_threads", arguments: {} },
+    })}\n`);
+    await blockedWrite;
+
+    const startedAt = Date.now();
+    const fatalClose = server.closeAfterFatal(25);
+    const normalClose = server.close();
+    await Promise.all([fatalClose, normalClose]);
+    assert.ok(Date.now() - startedAt < 500, "fatal drain must not wait indefinitely");
+    assert.equal(output.destroyed, true, "timed-out fatal drain must close the transport");
+    assert.equal(output.destroyCalls, 1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(backgroundErrors, []);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+    await server.close();
+    input.destroy();
+    output.destroy();
   }
 });
 

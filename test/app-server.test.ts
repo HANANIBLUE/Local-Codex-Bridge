@@ -1,15 +1,22 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { readFile, rm } from "node:fs/promises";
-import type { Writable } from "node:stream";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough, type Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  AppServerFatalError,
   AppServerManager,
+  AppServerShutdownError,
   createSerializedWriter,
   writeWithBackpressure,
+  type AppServerChild,
 } from "../src/app-server.js";
+import { BridgeLifecycle } from "../src/bridge-lifecycle.js";
 import { ControlSurface, TOOL_DEFINITIONS } from "../src/tools.js";
 
 const fakeCodex = fileURLToPath(new URL("../../test/fake-codex.mjs", import.meta.url));
@@ -17,10 +24,36 @@ const timeoutCodex = fileURLToPath(new URL("../../test/timeout-codex.mjs", impor
 const pendingWriteCodex = fileURLToPath(new URL("../../test/pending-write-codex.mjs", import.meta.url));
 const lateResponseCodex = fileURLToPath(new URL("../../test/late-response-codex.mjs", import.meta.url));
 const duplicateRequestCodex = fileURLToPath(new URL("../../test/duplicate-request-codex.mjs", import.meta.url));
+const initializeFailureCodex = fileURLToPath(new URL("../../test/initialize-failure-codex.mjs", import.meta.url));
+const pendingInitializeCodex = fileURLToPath(new URL("../../test/pending-initialize-codex.mjs", import.meta.url));
 const TEST_CWD = process.platform === "win32" ? "D:\\Bridge" : "/Bridge";
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(filePath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${filePath}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function waitForCondition(
+  condition: () => boolean,
+  message: string,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) {
+      throw new Error(message);
+    }
+    await delay(1);
+  }
 }
 
 class RejectingResponseManager extends AppServerManager {
@@ -57,6 +90,143 @@ class ControlledBackpressureSink extends EventEmitter {
     this.#callback = null;
     callback(error);
   }
+}
+
+class ControlledAppServerChild extends EventEmitter implements AppServerChild {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly pid: number | undefined = 42;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  readonly receivedMethods: string[] = [];
+  initialized = false;
+  exitEvents = 0;
+  killCalls = 0;
+
+  #stdinBuffer = "";
+  #exited = false;
+
+  constructor() {
+    super();
+    this.stdin.on("data", (chunk: Buffer) => this.#onStdin(chunk));
+    this.stdin.once("finish", () => {
+      if (this.exitCode !== null || this.signalCode !== null) {
+        this.emitExit(this.exitCode, this.signalCode);
+      } else {
+        this.emitExit(0, null);
+      }
+    });
+    queueMicrotask(() => this.emit("spawn"));
+  }
+
+  async closeStdout(): Promise<void> {
+    if (this.stdout.destroyed) {
+      return;
+    }
+    const closed = new Promise<void>((resolve) => this.stdout.once("close", resolve));
+    this.stdout.destroy();
+    await closed;
+  }
+
+  setExitState(code: number | null, signal: NodeJS.Signals | null): void {
+    this.exitCode = code;
+    this.signalCode = signal;
+  }
+
+  emitExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.#exited) {
+      return;
+    }
+    this.#exited = true;
+    this.exitCode = code;
+    this.signalCode = signal;
+    this.exitEvents += 1;
+    this.emit("exit", code, signal);
+    this.stdout.destroy();
+    this.stderr.destroy();
+  }
+
+  kill(): boolean {
+    this.killCalls += 1;
+    this.emitExit(null, "SIGTERM");
+    return true;
+  }
+
+  #onStdin(chunk: Buffer): void {
+    this.#stdinBuffer += chunk.toString("utf8");
+    while (true) {
+      const newline = this.#stdinBuffer.indexOf("\n");
+      if (newline < 0) {
+        return;
+      }
+      const line = this.#stdinBuffer.slice(0, newline);
+      this.#stdinBuffer = this.#stdinBuffer.slice(newline + 1);
+      if (!line) {
+        continue;
+      }
+      const message = JSON.parse(line) as Record<string, unknown>;
+      const method = typeof message.method === "string" ? message.method : "";
+      if (method === "initialize") {
+        this.#send({
+          id: message.id,
+          result: {
+            userAgent: "controlled-codex",
+            codexHome: "D:\\fake",
+            platformFamily: "windows",
+            platformOs: "windows",
+          },
+        });
+      } else if (method === "initialized") {
+        this.initialized = true;
+      } else if (method) {
+        this.receivedMethods.push(method);
+      }
+    }
+  }
+
+  #send(message: unknown): void {
+    this.stdout.write(`${JSON.stringify(message)}\n`);
+  }
+}
+
+function createControlledAppServer(
+  fatals: AppServerFatalError[],
+  stdoutExitGraceMs = 40,
+): {
+  manager: AppServerManager;
+  child: () => ControlledAppServerChild;
+} {
+  let spawnedChild: ControlledAppServerChild | undefined;
+  const manager = new AppServerManager(undefined, {
+    executable: "controlled-codex",
+    prefixArgs: ["--controlled-prefix"],
+    requestTimeoutMs: 500,
+    stdoutExitGraceMs,
+    spawnAppServer: (executable, args, options) => {
+      assert.equal(executable, "controlled-codex");
+      assert.deepEqual(args, [
+        "--controlled-prefix",
+        "app-server",
+        "--listen",
+        "stdio://",
+      ]);
+      assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe"]);
+      assert.equal(options.shell, false);
+      assert.equal(options.windowsHide, true);
+      assert.equal(options.env, process.env);
+      spawnedChild = new ControlledAppServerChild();
+      return spawnedChild;
+    },
+    onFatal: (error) => fatals.push(error),
+  });
+  return {
+    manager,
+    child: () => {
+      assert.ok(spawnedChild, "controlled app-server child was not spawned");
+      return spawnedChild;
+    },
+  };
 }
 
 test("control surface starts asynchronously, steers the same turn, uses raw request id, and observes final", async () => {
@@ -124,18 +294,450 @@ test("control surface starts asynchronously, steers the same turn, uses raw requ
   }
 });
 
-test("unexpected app-server death is latched and never auto-restarted", async () => {
+test("unexpected app-server death emits one stable fatal and remains latched", async () => {
+  const fatals: AppServerFatalError[] = [];
   const manager = new AppServerManager(undefined, {
     executable: process.execPath,
     prefixArgs: [fakeCodex],
     requestTimeoutMs: 2_000,
+    stdoutExitGraceMs: 50,
+    onFatal: (error) => fatals.push(error),
   });
   try {
-    await assert.rejects(manager.request("test/exit", {}), /exited unexpectedly/);
-    await assert.rejects(manager.request("thread/list", {}), /will not be auto-restarted/);
+    await assert.rejects(
+      manager.request("test/exit", {}),
+      (error: unknown) =>
+        error instanceof AppServerFatalError &&
+        /exited unexpectedly/.test(error.message) &&
+        /code=23/.test(error.message) &&
+        /signal=null/.test(error.message),
+    );
+    const fatal = fatals[0];
+    assert.ok(fatal instanceof AppServerFatalError);
+    await assert.rejects(
+      manager.request("thread/list", {}),
+      (error: unknown) => error === fatal,
+    );
+    await delay(75);
+    assert.equal(fatals.length, 1);
+    assert.deepEqual(fatal.toPayload(), {
+      error_code: "app_server_fatal",
+      status: "app_server_fatal",
+      recoverable: true,
+      bridge_exiting: true,
+      next_action: "restart_or_reconnect_then_codex_threads",
+      message: "Codex app-server exited unexpectedly (code=23, signal=null)",
+    });
   } finally {
     await manager.close();
   }
+});
+
+test("spawn and initialize failures emit one redacted app-server fatal", async (t) => {
+  const cases = [
+    {
+      name: "spawn",
+      executable: fileURLToPath(new URL("../../test/does-not-exist-codex", import.meta.url)),
+      prefixArgs: [] as string[],
+      message: /spawn|ENOENT|Failed to spawn/i,
+    },
+    {
+      name: "initialize",
+      executable: process.execPath,
+      prefixArgs: [initializeFailureCodex],
+      message: /synthetic initialize failure/,
+    },
+  ];
+
+  for (const current of cases) {
+    await t.test(current.name, async () => {
+      const fatals: AppServerFatalError[] = [];
+      const manager = new AppServerManager(undefined, {
+        executable: current.executable,
+        prefixArgs: current.prefixArgs,
+        requestTimeoutMs: 2_000,
+        onFatal: (error) => fatals.push(error),
+      });
+      try {
+        await assert.rejects(
+          manager.request("thread/list", {}),
+          (error: unknown) => error instanceof AppServerFatalError && current.message.test(error.message),
+        );
+        assert.equal(fatals.length, 1);
+        assert.equal(fatals[0]?.error_code, "app_server_fatal");
+        assert.doesNotMatch(fatals[0]?.message ?? "", /must-not-leak/);
+        if (current.name === "initialize") {
+          assert.match(fatals[0]?.message ?? "", /api_key=\[REDACTED\]/);
+        }
+      } finally {
+        await manager.close();
+      }
+    });
+  }
+});
+
+test("normal close before initialize request registration stays typed and non-fatal", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "local-codex-bridge-early-close-"));
+  const initializeMarkerPath = join(temporaryDirectory, "initialize-received");
+  const closeMarkerPath = join(temporaryDirectory, "stdin-closed");
+  const fatals: AppServerFatalError[] = [];
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (error: unknown): void => {
+    unhandledRejections.push(error);
+  };
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [pendingInitializeCodex, initializeMarkerPath, closeMarkerPath],
+    requestTimeoutMs: 2_000,
+    onFatal: (error) => fatals.push(error),
+  });
+  const threadId = "thread-normal-close-before-initialize-registration";
+  const turnId = "turn-normal-close-before-initialize-registration";
+  manager.runtime.markTurnAccepted(threadId, turnId);
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    const request = manager.request("thread/list", {});
+    const closing = manager.close();
+    const [requestResult, closeResult] = await Promise.allSettled([request, closing]);
+
+    assert.equal(requestResult.status, "rejected");
+    if (requestResult.status === "rejected") {
+      assert.ok(requestResult.reason instanceof AppServerShutdownError);
+      assert.equal(requestResult.reason instanceof AppServerFatalError, false);
+    }
+    assert.equal(closeResult.status, "fulfilled");
+    assert.deepEqual(fatals, []);
+    assert.equal(existsSync(initializeMarkerPath), false);
+    assert.equal(existsSync(closeMarkerPath), true, "close must wait for the fake child to exit");
+    const observation = manager.runtime.observe(threadId, 0, 10);
+    assert.equal(observation?.runtime_status, "inProgress");
+    assert.equal(observation?.active_turn_id, turnId);
+    assert.equal(observation?.terminal, null);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+    await manager.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("normal close while initialize is pending rejects with shutdown state and no fatal", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "local-codex-bridge-pending-init-"));
+  const markerPath = join(temporaryDirectory, "initialize-pending");
+  const fatals: AppServerFatalError[] = [];
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [pendingInitializeCodex, markerPath],
+    requestTimeoutMs: 2_000,
+    onFatal: (error) => fatals.push(error),
+  });
+  const threadId = "thread-normal-close-during-initialize";
+  const turnId = "turn-normal-close-during-initialize";
+  manager.runtime.markTurnAccepted(threadId, turnId);
+  try {
+    const request = manager.request("thread/list", {});
+    await waitForFile(markerPath);
+    const closing = manager.close();
+    await assert.rejects(request, (error: unknown) => error instanceof AppServerShutdownError);
+    await closing;
+    assert.deepEqual(fatals, []);
+    const observation = manager.runtime.observe(threadId, 0, 10);
+    assert.equal(observation?.runtime_status, "inProgress");
+    assert.equal(observation?.active_turn_id, turnId);
+    assert.equal(observation?.terminal, null);
+  } finally {
+    await manager.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("initialize fatal keeps priority when its fatal callback concurrently closes", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const exitCodes: number[] = [];
+  let shutdown: Promise<void> | undefined;
+  let lifecycle: BridgeLifecycle;
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [initializeFailureCodex],
+    requestTimeoutMs: 2_000,
+    onFatal: (error) => {
+      fatals.push(error);
+      shutdown = lifecycle.shutdown(1, "app_server_fatal");
+    },
+  });
+  lifecycle = new BridgeLifecycle({
+    async close(): Promise<void> {},
+    async closeAfterFatal(): Promise<void> {},
+  }, manager, {
+    setExitCode: (exitCode) => exitCodes.push(exitCode),
+  });
+
+  await assert.rejects(
+    manager.request("thread/list", {}),
+    (error: unknown) => error === fatals[0] && error instanceof AppServerFatalError,
+  );
+  await shutdown;
+  assert.equal(fatals.length, 1);
+  assert.equal(exitCodes.at(-1), 1);
+});
+
+test("protocol fatal rejects every app-server RPC and clears active runtime state once", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [fakeCodex],
+    requestTimeoutMs: 2_000,
+    onFatal: (error) => fatals.push(error),
+  });
+  const threadId = "thread-protocol-fatal";
+  const turnId = "turn-protocol-fatal";
+  try {
+    await manager.request("thread/list", {});
+    manager.runtime.markTurnAccepted(threadId, turnId);
+    assert.equal(
+      manager.runtime.recordServerRequest("pending-user-input", "item/tool/requestUserInput", {
+        threadId,
+        turnId,
+        api_key: "must-not-leak",
+      }),
+      "recorded",
+    );
+
+    const fatalRequest = manager.request("test/protocol-failure", {});
+    const concurrentRequest = manager.request("thread/list", {});
+    const settled = await Promise.allSettled([fatalRequest, concurrentRequest]);
+    assert.equal(settled.every((result) => result.status === "rejected"), true);
+    for (const result of settled) {
+      if (result.status === "rejected") {
+        assert.ok(result.reason instanceof AppServerFatalError);
+        assert.equal(result.reason, fatals[0]);
+      }
+    }
+
+    await delay(30);
+    assert.equal(fatals.length, 1, "invalid JSON and subsequent child exit must notify once");
+    assert.match(fatals[0]?.message ?? "", /invalid app-server JSONL/);
+    assert.deepEqual(manager.runtime.pendingForThread(threadId), []);
+    const observation = manager.runtime.observe(threadId, 0, 20);
+    assert.equal(observation?.runtime_status, "appServerExited");
+    assert.equal(observation?.active_turn_id, null);
+    assert.equal(observation?.terminal?.turn_id, turnId);
+    assert.equal(observation?.terminal?.status, "appServerExited");
+    assert.doesNotMatch(JSON.stringify(observation), /must-not-leak/);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("app-server stdout connection closure enters the typed fatal lifecycle", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (error: unknown): void => {
+    unhandledRejections.push(error);
+  };
+  const { manager, child } = createControlledAppServer(fatals, 30);
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    await manager.ensureReady();
+    const fakeChild = child();
+    assert.equal(fakeChild.initialized, true);
+    const request = manager.request("test/stdout-close", {});
+    await waitForCondition(
+      () => fakeChild.receivedMethods.includes("test/stdout-close"),
+      "controlled child did not receive test/stdout-close",
+    );
+    await fakeChild.closeStdout();
+    await assert.rejects(
+      request,
+      (error: unknown) =>
+        error instanceof AppServerFatalError &&
+        /stdout closed unexpectedly/.test(error.message),
+    );
+    await delay(60);
+    assert.equal(fatals.length, 1);
+    assert.doesNotMatch(fatals[0]?.message ?? "", /request timed out/);
+    assert.equal(fakeChild.exitEvents, 1);
+    assert.equal(fakeChild.killCalls, 0);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+    await manager.close();
+  }
+});
+
+test("stdout close followed by exit keeps exit as canonical fatal", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const { manager, child } = createControlledAppServer(fatals, 40);
+  try {
+    await manager.ensureReady();
+    const fakeChild = child();
+    const request = manager.request("test/close-then-exit", {});
+    await waitForCondition(
+      () => fakeChild.receivedMethods.includes("test/close-then-exit"),
+      "controlled child did not receive test/close-then-exit",
+    );
+    await fakeChild.closeStdout();
+    fakeChild.emitExit(23, null);
+    await assert.rejects(
+      request,
+      (error: unknown) =>
+        error instanceof AppServerFatalError &&
+        /exited unexpectedly/.test(error.message) &&
+        /code=23/.test(error.message) &&
+        /signal=null/.test(error.message) &&
+        !/stdout closed unexpectedly/.test(error.message),
+    );
+    await delay(80);
+    assert.equal(fatals.length, 1);
+    assert.equal(fakeChild.exitEvents, 1);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("normal close cancels pending stdout-exit grace", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const { manager, child } = createControlledAppServer(fatals, 30);
+  await manager.ensureReady();
+  const fakeChild = child();
+  await fakeChild.closeStdout();
+  await manager.close();
+  await delay(60);
+  assert.deepEqual(fatals, []);
+  assert.equal(fakeChild.exitEvents, 1);
+  assert.equal(fakeChild.killCalls, 0);
+});
+
+test("visible exit state makes stdout close use the exit fatal", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const { manager, child } = createControlledAppServer(fatals, 40);
+  try {
+    await manager.ensureReady();
+    const fakeChild = child();
+    const request = manager.request("test/visible-exit-state", {});
+    await waitForCondition(
+      () => fakeChild.receivedMethods.includes("test/visible-exit-state"),
+      "controlled child did not receive test/visible-exit-state",
+    );
+    fakeChild.setExitState(23, null);
+    await fakeChild.closeStdout();
+    await assert.rejects(
+      request,
+      (error: unknown) =>
+        error instanceof AppServerFatalError &&
+        error.message === "Codex app-server exited unexpectedly (code=23, signal=null)",
+    );
+    await delay(80);
+    assert.equal(fatals.length, 1);
+    assert.equal(fakeChild.exitEvents, 0, "visible exit state must not require a synthetic exit event");
+  } finally {
+    await manager.close();
+  }
+});
+
+test("stdout exit grace requires a positive integer", () => {
+  for (const stdoutExitGraceMs of [0, -1, 1.5]) {
+    assert.throws(
+      () => new AppServerManager(undefined, { stdoutExitGraceMs }),
+      /stdoutExitGraceMs must be a positive integer/,
+    );
+  }
+});
+
+test("fatal, signal, and repeated shutdown requests coordinate one nonzero top-level close", async () => {
+  let normalServerCloses = 0;
+  let fatalServerCloses = 0;
+  let appServerCloses = 0;
+  let uxCloses = 0;
+  const exitCodes: number[] = [];
+  const server = {
+    async close(): Promise<void> {
+      normalServerCloses += 1;
+    },
+    async closeAfterFatal(timeoutMs?: number): Promise<void> {
+      assert.equal(timeoutMs, 250);
+      fatalServerCloses += 1;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    },
+  };
+  const appServer = {
+    async close(): Promise<void> {
+      appServerCloses += 1;
+    },
+    runtime: {
+      closeUxProjection(): void {
+        uxCloses += 1;
+      },
+    },
+  };
+  const lifecycle = new BridgeLifecycle(server, appServer, {
+    fatalDrainTimeoutMs: 250,
+    setExitCode: (exitCode) => exitCodes.push(exitCode),
+  });
+
+  const first = lifecycle.shutdown(1, "app_server_fatal");
+  const concurrentSignal = lifecycle.shutdown(0, "normal");
+  const repeatedFatal = lifecycle.shutdown(1, "app_server_fatal");
+  assert.equal(first, concurrentSignal);
+  assert.equal(first, repeatedFatal);
+  await Promise.all([first, concurrentSignal, repeatedFatal]);
+
+  assert.equal(normalServerCloses, 0);
+  assert.equal(fatalServerCloses, 1);
+  assert.equal(appServerCloses, 1);
+  assert.equal(uxCloses, 1);
+  assert.equal(exitCodes.at(-1), 1);
+  assert.equal(exitCodes.every((code) => code === 1), true);
+});
+
+test("normal top-level close keeps normal exit semantics", async () => {
+  let normalServerCloses = 0;
+  let fatalServerCloses = 0;
+  let appServerCloses = 0;
+  let uxCloses = 0;
+  let exitCode = -1;
+  const lifecycle = new BridgeLifecycle({
+    async close(): Promise<void> {
+      normalServerCloses += 1;
+    },
+    async closeAfterFatal(): Promise<void> {
+      fatalServerCloses += 1;
+    },
+  }, {
+    async close(): Promise<void> {
+      appServerCloses += 1;
+    },
+    runtime: {
+      closeUxProjection(): void {
+        uxCloses += 1;
+      },
+    },
+  }, {
+    setExitCode: (value) => {
+      exitCode = value;
+    },
+  });
+
+  await lifecycle.shutdown(0, "normal");
+  assert.equal(normalServerCloses, 1);
+  assert.equal(fatalServerCloses, 0);
+  assert.equal(appServerCloses, 1);
+  assert.equal(uxCloses, 1);
+  assert.equal(exitCode, 0);
+});
+
+test("explicit app-server close does not emit a fatal notification", async () => {
+  const fatals: AppServerFatalError[] = [];
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [fakeCodex],
+    requestTimeoutMs: 2_000,
+    onFatal: (error) => fatals.push(error),
+  });
+  await manager.request("thread/list", {});
+  await manager.close();
+  assert.deepEqual(fatals, []);
 });
 
 test("failed app-server response write restores the original pending request", async () => {
@@ -548,6 +1150,41 @@ test("serialized app-server writes preserve order and wait for drain", async () 
   sink.completeWrite();
   sink.emit("drain");
   await second;
+});
+
+test("serialized initialized notification preserves typed shutdown while queued", async () => {
+  const shutdownError = new AppServerShutdownError();
+  let shuttingDown = false;
+  let releaseInitializeWrite: (() => void) | undefined;
+  let markInitializeWriteStarted: (() => void) | undefined;
+  const initializeWriteStarted = new Promise<void>((resolve) => {
+    markInitializeWriteStarted = resolve;
+  });
+  const initializeWriteGate = new Promise<void>((resolve) => {
+    releaseInitializeWrite = resolve;
+  });
+  const write = createSerializedWriter(async (chunk) => {
+    if (shuttingDown) {
+      throw shutdownError;
+    }
+    if (chunk === "initialize\n") {
+      markInitializeWriteStarted?.();
+      await initializeWriteGate;
+    }
+  });
+
+  const initializeWrite = write("initialize\n");
+  await initializeWriteStarted;
+  const initializedNotificationWrite = write("initialized\n");
+  const initializedRejection = assert.rejects(
+    initializedNotificationWrite,
+    (error: unknown) => error === shutdownError && error instanceof AppServerShutdownError,
+  );
+  shuttingDown = true;
+  releaseInitializeWrite?.();
+
+  await initializeWrite;
+  await initializedRejection;
 });
 
 test("app-server stream writes reject on error or close and the chain recovers", async () => {

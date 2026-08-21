@@ -6,11 +6,11 @@ Local Codex Bridge 是一个面向 Windows 和 macOS 的轻量 MCP stdio 桥接�
 
 它解决的是一个很具体的问题：ChatGPT 适合对话、拆解目标和持续监督，Codex 则能在本机工作区里使用真实的文件、命令和开发工具。Bridge 在两者之间提供 7 个边界清楚的控制工具，不再额外发明一套任务系统。
 
-## 当前公开版本
+## 当前公开版本与目标版本
 
-**V2.2.0** · [查看更新日志](CHANGELOG.md)
+当前真正已经公开的最新 tag 是 **V2.1.2**。**V2.2.0** 是尚未发布的目标版本；本仓库当前代码正在为该版本完成发布前加固，尚未创建 `v2.2.0` tag 或 Release。详见[更新日志](CHANGELOG.md)。
 
-本版本在保持 7 个 MCP 工具和既有监督边界不变的前提下，新增 macOS 主机原生路径、checkpoint 默认目录、跨平台 smoke prompt 和测试入口支持。核心 Bridge 现声明支持 Windows 与 macOS；可选 Tray 仍仅支持 Windows。
+V2.2.0 聚焦核心 Bridge 的平台兼容、fatal 生命周期和工具契约加固：新增 macOS 主机原生路径支持，修复 app-server fatal 后 Bridge 假在线的问题，并让缺少 `cwd` 的调用真正获得可恢复提示。macOS 后台 LaunchAgent 不属于 V2.2.0，计划在未来 V2.3.0 单独设计、实现和验证；可选 Tray 仍仅支持 Windows。
 
 > [!IMPORTANT]
 > 这是非官方社区项目，与 OpenAI 不存在隶属、授权或背书关系。ChatGPT、Codex 和 OpenAI 是其各自权利人的产品或标识。
@@ -37,7 +37,7 @@ Local Codex Bridge
 
 换句话说，Local Codex Bridge 是提供给 ChatGPT 的 MCP Server；Codex app-server 是 Bridge 在内部驱动原生 Codex 的官方协议进程。它们不是同一个接口，也不是两套并行的任务系统。
 
-当工具首次需要原生 Codex 时，Bridge 会懒启动一个官方 app-server 子进程。Bridge 自己不创建 job ID、不维护队列、不保存第二份对话历史，也不会自动重试或自动重启意外退出的 app-server。
+当工具首次需要原生 Codex 时，Bridge 会懒启动一个官方 app-server 子进程。Bridge 自己不创建 job ID、不维护队列、不保存第二份对话历史，也不会自动重试或在进程内自动重启意外退出的 app-server。不可恢复的 app-server fatal 会使 Bridge 完成本地收尾并以非零状态退出，由外部监督层决定是否重启整条进程链。
 
 ## 7 个 MCP 工具
 
@@ -112,6 +112,22 @@ env:     CODEX_EXE=<absolute Codex executable path>   # 可选
 - 只有明确需要停止当前回合时才应 interrupt。
 - 是否复用线程取决于任务连续性和上下文价值；`thread_id` 不是永久任务编号。
 
+### Breaking Change：`codex_turn.cwd`
+
+从目标版本 V2.2.0 开始，每次 `codex_turn` 都在语义上要求提供 `cwd`，包括恢复既有线程。公开 JSON Schema 有意识地只把 `text` 放在 `required` 中；这不表示 `cwd` 真正可选，而是为了让严格 MCP 宿主也能把缺参调用交给 handler，并收到 `status: "input_required"`、`error_code: "cwd_required"` 和先调用 `codex_threads` 的恢复提示。缺少 `cwd` 时不会启动或恢复线程，也不会调用原生 Codex app-server。
+
+### app-server fatal 与客户端恢复
+
+Codex app-server 出现不可恢复的 spawn、initialize、进程、stdio 或协议 fatal 后，Bridge 会锁存并清理本地 fatal 状态、结束活动 turn 的本地运行时状态、清空 pending approval / user-input 请求、拒绝未决的 Bridge → app-server RPC，然后协调关闭 MCP 并以非零状态退出。Bridge 不会在同一进程内重启 app-server。
+
+正在处理的工具调用会尽量收到带有 `error_code: "app_server_fatal"`、`bridge_exiting: true` 和恢复动作的 MCP 错误结果，但这是 best effort；如果 stdio 或 Tunnel 已经断开，客户端最坏情况下可能只看到传输断连。
+
+恢复时：
+
+1. 重新建立 Tunnel / MCP 连接；外部监督层可以选择重启整条进程链，但 V2.2.0 本身不保证自动重启。
+2. 调用 `codex_threads` 重新读取持久线程并对齐状态。
+3. 不要假设旧回合一定已经停止。Bridge 的内存态已经丢失，但原生 Codex 回合可能已经停止，也可能仍有持久状态可读；应以重新连接后的持久证据为准。
+
 ## 可选：Secure MCP Tunnel
 
 远程 MCP 连接可以在 Bridge 前面放置 Secure MCP Tunnel。先完成构建，再把 Tunnel 的 MCP command 指向：
@@ -121,6 +137,8 @@ node <absolute repository path>/dist/src/index.js
 ```
 
 Tunnel 的安装、认证、profile、端口、ready endpoint 和进程生命周期都属于外部配置。本仓库不会创建或修改 Tunnel profile，也没有内置生产端口或凭据。
+
+V2.2.0 不提供 macOS LaunchAgent、KeepAlive、watchdog、日志轮转或卸载脚本；这些后台运行能力计划在未来 V2.3.0 单独交付。
 
 ## 可选：Windows Tray
 
@@ -157,7 +175,7 @@ Local Codex Bridge 不会创建新的操作系统沙箱。真正的文件、命�
 - 原生线程、回合、历史和最终输出由官方 Codex 持久化。
 - Bridge 的事件 ring、活动回合状态和 pending request 只在内存中存在。Bridge 重启后，`codex_observe` 可以回退读取持久历史，但会明确标记实时状态无法重建。
 - Windows 新安装的 checkpoint 默认位于 `%LOCALAPPDATA%\LocalCodexBridge\checkpoints\<sha256(thread_id)>.json`；macOS 默认位于 `~/Library/Application Support/LocalCodexBridge/checkpoints/<sha256(thread_id)>.json`。可用 `LOCAL_CODEX_BRIDGE_CHECKPOINT_DIR` 指定其他绝对目录。Windows 若检测到既有旧默认目录，Bridge 会继续使用它；也可用旧的 `LUMEN_CODEX_V2_CHECKPOINT_DIR` 显式指定，不会自动迁移数据。
-- app-server 意外退出后会被锁定为失败状态，不会在同一个 Bridge 进程中自动重启。
+- app-server fatal 后不会在同一个 Bridge 进程中自动重启；Bridge 会协调关闭并以非零状态退出，使外部监督层能够检测到故障。
 - `cwd` 使用 Bridge 主机的原生绝对路径：Windows 接受盘符路径并拒绝 UNC 或 Windows device path；macOS 接受 POSIX 绝对路径。
 - Windows Tray 仍只支持 Windows，并依赖 Windows PowerShell、Windows Forms 和 WMI/CIM；本项目尚未声明或验证 Linux 支持。
 - Bridge 不是任务队列、后台监控器、HTTP MCP Server、通用 shell endpoint、Codex 运行时安装器或 Tunnel profile 管理器。

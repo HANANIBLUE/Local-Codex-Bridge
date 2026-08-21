@@ -39,12 +39,16 @@ function propertySchema(toolName: string, propertyName: string): Record<string, 
   return object(properties[propertyName]);
 }
 
-test("codex_turn requires cwd explicitly and recovers without starting native work", async (t) => {
+test("codex_turn keeps cwd semantically required while Schema permits soft recovery", async (t) => {
   const turn = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_turn");
   assert.ok(turn);
-  assert.deepEqual(turn.inputSchema.required, ["text", "cwd"]);
+  assert.deepEqual(turn.inputSchema.required, ["text"]);
   assert.equal("anyOf" in turn.inputSchema, false);
   assert.equal(propertySchema("codex_turn", "cwd").minLength, 1);
+  assert.match(
+    propertySchema("codex_turn", "cwd").description as string,
+    /Semantically required for every call, including resume/,
+  );
   assert.match(turn.description, /Always provide the absolute host-native cwd/);
 
   const cases = [
